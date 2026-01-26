@@ -121,9 +121,9 @@ def voilin_plot(adata, selected_project_path):
     with open(cfg_dir / "highcharts_data.json", "w") as f:
         json.dump(data_for_highcharts, f, indent=4)
 
-    sc.pl.violin(
+    """ sc.pl.violin(
     adata,
     ["n_genes_by_counts", "total_counts", "pct_counts_mt"],
     jitter=0.4,
     multi_panel=True,
-)
+) """

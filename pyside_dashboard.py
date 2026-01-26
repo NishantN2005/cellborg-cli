@@ -11,8 +11,21 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 import json
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+import webbrowser
+import tempfile
+from PySide6.QtCore import QUrl
+
+# Prefer to embed Plotly in a Qt WebEngine view if available, otherwise open in browser
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    WEBENGINE_AVAILABLE = True
+except Exception:
+    QWebEngineView = None
+    WEBENGINE_AVAILABLE = False
+
+import plotly.graph_objs as go
+import plotly.io as pio
+from plotly.subplots import make_subplots
 
 from qc_functions import read_10x_mtx, calculate_qc_metrics, find_species, voilin_plot, SPECIES_TO_MT
 
@@ -157,9 +170,54 @@ class Dashboard(QWidget):
                 hc = json.load(fh)
 
             # extract arrays for the three violin metrics
-            a1 = hc.get("n_genes_by_counts") or []
-            a2 = hc.get("total_counts") or []
-            a3 = hc.get("pct_counts_mt") or []
+            # Support two JSON layouts:
+            # 1) {"n_genes_by_counts": [...], "total_counts": [...], ...}
+            # 2) {"CELLID1": {"n_genes": ..., "total_counts": ..., "pct_counts_mt": ...}, ...}
+            a1 = []
+            a2 = []
+            a3 = []
+
+            if isinstance(hc, dict):
+                # detect layout 1
+                if "n_genes_by_counts" in hc and "total_counts" in hc and "pct_counts_mt" in hc:
+                    def _to_nums(seq):
+                        try:
+                            return [float(x) for x in seq]
+                        except Exception:
+                            return []
+
+                    a1 = _to_nums(hc.get("n_genes_by_counts") or [])
+                    a2 = _to_nums(hc.get("total_counts") or [])
+                    a3 = _to_nums(hc.get("pct_counts_mt") or [])
+                else:
+                    # assume layout 2: values are dicts per cell id
+                    vals = list(hc.values())
+                    if vals and isinstance(vals[0], dict):
+                        for v in vals:
+                            try:
+                                if v is None:
+                                    continue
+                                a1.append(float(v.get("n_genes"))) if v.get("n_genes") is not None else None
+                            except Exception:
+                                pass
+                            try:
+                                a2.append(float(v.get("total_counts"))) if v.get("total_counts") is not None else None
+                            except Exception:
+                                pass
+                            try:
+                                a3.append(float(v.get("pct_counts_mt"))) if v.get("pct_counts_mt") is not None else None
+                            except Exception:
+                                pass
+                    else:
+                        # unknown structure: leave arrays empty
+                        a1 = []
+                        a2 = []
+                        a3 = []
+            else:
+                # unexpected JSON type
+                a1 = []
+                a2 = []
+                a3 = []
 
             dlg = ViolinDialog(a1, a2, a3, parent=self)
             dlg.exec()
@@ -325,6 +383,77 @@ class MetadataDialog(QDialog):
 
     def get_data(self):
         return {"title": self.title_edit.text().strip() or None, "description": self.desc_edit.toPlainText().strip()}
+
+
+class ViolinDialog(QDialog):
+    """Modal dialog that shows three violin plots using Plotly.
+
+    If Qt WebEngine is available the plot is embedded in the dialog; otherwise
+    the HTML is written to a temp file and opened in the user's default browser.
+    """
+    def __init__(self, arr1, arr2, arr3, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Violin plots")
+        self.resize(1000, 600)
+        layout = QVBoxLayout(self)
+
+        data = [arr1 or [], arr2 or [], arr3 or []]
+        titles = ["n_genes_by_counts", "total_counts", "pct_counts_mt"]
+
+        # build subplot figure
+        fig = make_subplots(rows=1, cols=3, subplot_titles=titles)
+        for i, series in enumerate(data, start=1):
+            try:
+                y = [float(x) for x in series]
+            except Exception:
+                y = []
+
+            if y:
+                fig.add_trace(go.Violin(y=y, name=titles[i-1], box_visible=True, meanline_visible=True), row=1, col=i)
+            else:
+                # add empty scatter with annotation
+                fig.add_trace(go.Scatter(x=[0], y=[0], mode='markers', marker_opacity=0), row=1, col=i)
+
+        fig.update_layout(height=520, width=980, showlegend=False)
+
+        # Embed Plotly JS into the HTML so the view works offline / without CDN access
+        html = pio.to_html(fig, full_html=True, include_plotlyjs=True)
+
+        if WEBENGINE_AVAILABLE:
+            view = QWebEngineView()
+            # write to a temporary file and load it to ensure resources load correctly
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.html')
+            tmp.write(html.encode('utf-8'))
+            tmp.flush()
+            tmp.close()
+            view.load(QUrl.fromLocalFile(tmp.name))
+            layout.addWidget(view)
+            # keep temp file path to remove on close
+            self._tmpfile = tmp.name
+        else:
+            # No embedded web engine: open in browser and show a message in the dialog
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.html')
+            tmp.write(html.encode('utf-8'))
+            tmp.flush()
+            tmp.close()
+            webbrowser.open(f'file://{tmp.name}')
+            info = QLabel("Opened violin plots in your default browser (Qt WebEngine not available).")
+            layout.addWidget(info)
+            self._tmpfile = tmp.name
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject)
+        btns.accepted.connect(self.accept)
+        layout.addWidget(btns)
+
+    def closeEvent(self, event):
+        # try to remove temporary file if present
+        try:
+            if hasattr(self, '_tmpfile') and self._tmpfile:
+                os.unlink(self._tmpfile)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 
 def main():
