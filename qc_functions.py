@@ -57,6 +57,7 @@ def calculate_qc_metrics(mt: str, adata: ad.AnnData):
     # hemoglobin genes
     adata.var["hb"] = adata.var_names.str.contains("^HB[^(P)]")
 
+    print("Calculating QC metrics")
     sc.pp.calculate_qc_metrics(
         adata, qc_vars=["mt", "ribo", "hb"], inplace=True, log1p=True
     )
@@ -82,7 +83,7 @@ def find_species(features_path):
         print("Trying to read features file")
         df = pd.read_csv(p, sep='\t', header=None, compression='infer')
         print('here is if it is there: ', 'MT-ND1' in df[1].values)
-        
+
         for mt_gene, species in MT_TO_SPECIES.items():
             if mt_gene in df[1].values:
                 print(f"Detected species: {species} (found {mt_gene})")
@@ -91,3 +92,38 @@ def find_species(features_path):
         raise ValueError("Mitochondrial gene not found in features file.")
     except Exception as e:
         raise RuntimeError(f"Failed to read features file '{p}': {e}")
+    
+
+def voilin_plot(adata, selected_project_path):
+    cfg_dir = _Path(selected_project_path) / "cellborg-cli"
+    # One can now inspect violin plots of some of the computed QC metrics:
+    # 
+    # * the number of genes expressed in the count matrix
+    # * the total counts per cell
+    # * the percentage of counts in mitochondrial genes
+    # saves violin image file as violin.png, copy this to S3 under plots folder.
+    print("------ voilin_plot begins -------")
+
+    print("Creating violin df")
+    print(adata.obs.columns)
+    data_df = adata.obs[["n_genes_by_counts", "total_counts", "pct_counts_mt"]]
+
+    print("Creating violin json")
+    data_for_highcharts = {
+        index:{
+                "n_genes":row['n_genes_by_counts'],
+                "total_counts": row["total_counts"],
+                "pct_counts_mt":row["pct_counts_mt"]
+        }
+        for index, row in data_df.iterrows()
+    }
+    print("uploading json file")
+    with open(cfg_dir / "highcharts_data.json", "w") as f:
+        json.dump(data_for_highcharts, f, indent=4)
+
+    sc.pl.violin(
+    adata,
+    ["n_genes_by_counts", "total_counts", "pct_counts_mt"],
+    jitter=0.4,
+    multi_panel=True,
+)

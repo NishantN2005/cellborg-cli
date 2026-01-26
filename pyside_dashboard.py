@@ -11,8 +11,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 import json
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
-from qc_functions import read_10x_mtx, calculate_qc_metrics, find_species, SPECIES_TO_MT
+from qc_functions import read_10x_mtx, calculate_qc_metrics, find_species, voilin_plot, SPECIES_TO_MT
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECTS_DIR = BASE_DIR / "projects"
@@ -121,6 +123,7 @@ class Dashboard(QWidget):
 
         try:
             adata = read_10x_mtx(SELECTED_PROJECT_PATH)
+            print("Read adata with shape:", adata.shape)
         except Exception as e:
             QMessageBox.critical(self, "Read failed", f"Failed to read project data: {e}")
             return
@@ -139,7 +142,30 @@ class Dashboard(QWidget):
             QMessageBox.information(self, "QC", "QC completed (results not shown).")
         except Exception as e:
             QMessageBox.critical(self, "QC failed", f"QC calculation failed: {e}")
+        try:
+            voilin_plot(adata, SELECTED_PROJECT_PATH)
+        except Exception as e:
+            QMessageBox.critical(self, "Plot failed", f"Failed to create violin plot: {e}")
+            return
 
+        # After voilin_plot runs, attempt to read generated highcharts_data.json
+        try:
+            hc_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "highcharts_data.json"
+            if not hc_path.exists():
+                raise FileNotFoundError(f"{hc_path} not found")
+            with hc_path.open("r", encoding="utf-8") as fh:
+                hc = json.load(fh)
+
+            # extract arrays for the three violin metrics
+            a1 = hc.get("n_genes_by_counts") or []
+            a2 = hc.get("total_counts") or []
+            a3 = hc.get("pct_counts_mt") or []
+
+            dlg = ViolinDialog(a1, a2, a3, parent=self)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "Plot data", f"Could not load violin plot data: {e}")
+            return
     def refresh(self):
         # Clear existing entries
         for i in reversed(range(self.list_layout.count())):
