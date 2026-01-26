@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
     QMessageBox, QScrollArea, QFrame, QHBoxLayout, QDialog, QLineEdit, QTextEdit,
-    QFormLayout, QDialogButtonBox
+    QFormLayout, QDialogButtonBox, QSpinBox, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt
 import json
@@ -152,7 +152,6 @@ class Dashboard(QWidget):
 
         try:
             calculate_qc_metrics(mt, adata)
-            QMessageBox.information(self, "QC", "QC completed (results not shown).")
         except Exception as e:
             QMessageBox.critical(self, "QC failed", f"QC calculation failed: {e}")
         try:
@@ -176,54 +175,35 @@ class Dashboard(QWidget):
             a1 = []
             a2 = []
             a3 = []
-
+            print("hc: ", hc)
             if isinstance(hc, dict):
-                # detect layout 1
-                if "n_genes_by_counts" in hc and "total_counts" in hc and "pct_counts_mt" in hc:
-                    def _to_nums(seq):
+                # assume  values are dicts per cell id
+                vals = list(hc.values())
+                if vals and isinstance(vals[0], dict):
+                    for v in vals:
                         try:
-                            return [float(x) for x in seq]
+                            if v is None:
+                                continue
+                            a1.append(float(v.get("n_genes"))) if v.get("n_genes") is not None else None
                         except Exception:
-                            return []
+                            pass
+                        try:
+                            a2.append(float(v.get("total_counts"))) if v.get("total_counts") is not None else None
+                        except Exception:
+                            pass
+                        try:
+                            a3.append(float(v.get("pct_counts_mt"))) if v.get("pct_counts_mt") is not None else None
+                        except Exception:
+                            pass
 
-                    a1 = _to_nums(hc.get("n_genes_by_counts") or [])
-                    a2 = _to_nums(hc.get("total_counts") or [])
-                    a3 = _to_nums(hc.get("pct_counts_mt") or [])
-                else:
-                    # assume layout 2: values are dicts per cell id
-                    vals = list(hc.values())
-                    if vals and isinstance(vals[0], dict):
-                        for v in vals:
-                            try:
-                                if v is None:
-                                    continue
-                                a1.append(float(v.get("n_genes"))) if v.get("n_genes") is not None else None
-                            except Exception:
-                                pass
-                            try:
-                                a2.append(float(v.get("total_counts"))) if v.get("total_counts") is not None else None
-                            except Exception:
-                                pass
-                            try:
-                                a3.append(float(v.get("pct_counts_mt"))) if v.get("pct_counts_mt") is not None else None
-                            except Exception:
-                                pass
-                    else:
-                        # unknown structure: leave arrays empty
-                        a1 = []
-                        a2 = []
-                        a3 = []
-            else:
-                # unexpected JSON type
-                a1 = []
-                a2 = []
-                a3 = []
-
-            dlg = ViolinDialog(a1, a2, a3, parent=self)
-            dlg.exec()
+            # build row tuples for plotting and filtering
+                rows = list(zip(a1, a2, a3))
+                dlg = ViolinDialog(rows, project_path=SELECTED_PROJECT_PATH, parent=self)
+                dlg.exec()
         except Exception as e:
             QMessageBox.warning(self, "Plot data", f"Could not load violin plot data: {e}")
             return
+        
     def refresh(self):
         # Clear existing entries
         for i in reversed(range(self.list_layout.count())):
@@ -386,74 +366,204 @@ class MetadataDialog(QDialog):
 
 
 class ViolinDialog(QDialog):
-    """Modal dialog that shows three violin plots using Plotly.
+    """Modal dialog that shows three violin plots using Plotly and provides filters.
 
-    If Qt WebEngine is available the plot is embedded in the dialog; otherwise
-    the HTML is written to a temp file and opened in the user's default browser.
+    The dialog accepts `rows` as an iterable of tuples: (n_genes, total_counts, pct_counts_mt).
+    When Qt WebEngine is available the plot is embedded and updates in-place when the
+    filter controls change. Otherwise the plot is opened in the browser and controls
+    are disabled.
     """
-    def __init__(self, arr1, arr2, arr3, parent=None):
+    def __init__(self, rows, project_path: str | None = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Violin plots")
-        self.resize(1000, 600)
+        self.setWindowTitle("Violin + Scatter")
+        self.resize(1100, 750)
+        self.rows = [tuple(r) for r in (rows or [])]
         layout = QVBoxLayout(self)
 
-        data = [arr1 or [], arr2 or [], arr3 or []]
-        titles = ["n_genes_by_counts", "total_counts", "pct_counts_mt"]
+        # Controls: min nFeature, max nFeature, pct mt less than
+        ctrl_layout = QHBoxLayout()
+        self.min_feat = QSpinBox()
+        self.min_feat.setRange(0, 10_000_000)
+        self.min_feat.setValue(0)
+        self.max_feat = QSpinBox()
+        self.max_feat.setRange(0, 10_000_000)
+        # default max = max n_genes in data or 10000
+        max_default = max((int(r[0]) for r in self.rows if r and r[0] is not None), default=10000)
+        self.max_feat.setValue(max_default)
+        self.pct_mt = QDoubleSpinBox()
+        self.pct_mt.setRange(0.0, 100.0)
+        self.pct_mt.setDecimals(3)
+        self.pct_mt.setValue(100.0)
 
-        # build subplot figure
-        fig = make_subplots(rows=1, cols=3, subplot_titles=titles)
-        for i, series in enumerate(data, start=1):
-            try:
-                y = [float(x) for x in series]
-            except Exception:
-                y = []
+        ctrl_layout.addWidget(QLabel("nFeature_RNA greater than:"))
+        ctrl_layout.addWidget(self.min_feat)
+        ctrl_layout.addWidget(QLabel("nFeature_RNA less than:"))
+        ctrl_layout.addWidget(self.max_feat)
+        ctrl_layout.addWidget(QLabel("% mitochondrial genes less than:"))
+        ctrl_layout.addWidget(self.pct_mt)
+        ctrl_layout.addStretch()
+        layout.addLayout(ctrl_layout)
 
-            if y:
-                fig.add_trace(go.Violin(y=y, name=titles[i-1], box_visible=True, meanline_visible=True), row=1, col=i)
-            else:
-                # add empty scatter with annotation
-                fig.add_trace(go.Scatter(x=[0], y=[0], mode='markers', marker_opacity=0), row=1, col=i)
+        # connect to update
+        self.min_feat.valueChanged.connect(self._on_filter_change)
+        self.max_feat.valueChanged.connect(self._on_filter_change)
+        self.pct_mt.valueChanged.connect(self._on_filter_change)
 
-        fig.update_layout(height=520, width=980, showlegend=False)
-
-        # Embed Plotly JS into the HTML so the view works offline / without CDN access
-        html = pio.to_html(fig, full_html=True, include_plotlyjs=True)
+        # content area for plot or info
+        self._view = None
+        self._info_label = None
+        self._tmpfile = None
 
         if WEBENGINE_AVAILABLE:
-            view = QWebEngineView()
-            # write to a temporary file and load it to ensure resources load correctly
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.html')
-            tmp.write(html.encode('utf-8'))
-            tmp.flush()
-            tmp.close()
-            view.load(QUrl.fromLocalFile(tmp.name))
-            layout.addWidget(view)
-            # keep temp file path to remove on close
-            self._tmpfile = tmp.name
+            self._view = QWebEngineView()
+            layout.addWidget(self._view, 1)
         else:
-            # No embedded web engine: open in browser and show a message in the dialog
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.html')
-            tmp.write(html.encode('utf-8'))
-            tmp.flush()
-            tmp.close()
-            webbrowser.open(f'file://{tmp.name}')
-            info = QLabel("Opened violin plots in your default browser (Qt WebEngine not available).")
-            layout.addWidget(info)
-            self._tmpfile = tmp.name
+            self._info_label = QLabel("Plots will open in your default browser (Qt WebEngine not available). Filters are disabled.")
+            layout.addWidget(self._info_label)
+            # disable controls (cannot re-render in browser fallback)
+            self.min_feat.setEnabled(False)
+            self.max_feat.setEnabled(False)
+            self.pct_mt.setEnabled(False)
 
+        # Save button + Close
+        btn_row = QHBoxLayout()
+        self.save_btn = QPushButton("Save Filters")
+        self.save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(self.save_btn)
+        btn_row.addStretch()
         btns = QDialogButtonBox(QDialogButtonBox.Close)
         btns.rejected.connect(self.reject)
         btns.accepted.connect(self.accept)
-        layout.addWidget(btns)
+        btn_row.addWidget(btns)
+        layout.addLayout(btn_row)
+
+        # store project path for saving metadata
+        self._project_path = project_path
+
+        # initial render
+        self._render_plot(self.rows)
+
+    def _on_filter_change(self, *_):
+        # filter rows according to controls and re-render
+        minv = self.min_feat.value()
+        maxv = self.max_feat.value()
+        pct_max = float(self.pct_mt.value())
+        filtered = []
+        for r in self.rows:
+            try:
+                n_genes = float(r[0])
+                total = float(r[1])
+                pct = float(r[2])
+            except Exception:
+                continue
+            if n_genes >= minv and n_genes <= maxv and pct <= pct_max:
+                filtered.append((n_genes, total, pct))
+
+        self._render_plot(filtered)
+
+    def _render_plot(self, rows):
+        # build data arrays from rows
+        a_n = [r[0] for r in rows]
+        a_tot = [r[1] for r in rows]
+        a_pct = [r[2] for r in rows]
+
+        titles = ["n_genes_by_counts", "total_counts", "pct_counts_mt"]
+        specs = [[{}, {}, {}], [{"colspan": 3}, None, None]]
+        fig = make_subplots(rows=2, cols=3, specs=specs, subplot_titles=(titles + ["Scatter: total_counts vs n_genes_by_counts (color=pct_counts_mt)"]))
+
+        # violins
+        for i, arr in enumerate((a_n, a_tot, a_pct), start=1):
+            y = []
+            try:
+                y = [float(x) for x in arr]
+            except Exception:
+                y = []
+            if y:
+                fig.add_trace(go.Violin(y=y, name=titles[i-1], box_visible=True, meanline_visible=True), row=1, col=i)
+            else:
+                fig.add_trace(go.Scatter(x=[0], y=[0], mode='markers', marker_opacity=0), row=1, col=i)
+
+        # scatter
+        x_vals = a_tot
+        y_vals = a_n
+        c_vals = a_pct
+        if x_vals and y_vals:
+            scatter = go.Scatter(
+                x=x_vals,
+                y=y_vals,
+                mode='markers',
+                marker=dict(color=c_vals if c_vals else None, colorscale='Viridis', showscale=True, colorbar=dict(title='pct_counts_mt')),
+                text=[f"pct_counts_mt: {v}" for v in c_vals] if c_vals else None,
+            )
+            fig.add_trace(scatter, row=2, col=1)
+        else:
+            fig.add_trace(go.Scatter(x=[0], y=[0], mode='markers', marker_opacity=0), row=2, col=1)
+
+        fig.update_layout(height=780, width=980, showlegend=False)
+
+        html = pio.to_html(fig, full_html=True, include_plotlyjs=True)
+
+        # remove previous tempfile
+        try:
+            if self._tmpfile:
+                os.unlink(self._tmpfile)
+        except Exception:
+            pass
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.html')
+        tmp.write(html.encode('utf-8'))
+        tmp.flush()
+        tmp.close()
+        self._tmpfile = tmp.name
+
+        if WEBENGINE_AVAILABLE and self._view is not None:
+            # load file in web view
+            self._view.load(QUrl.fromLocalFile(tmp.name))
+        else:
+            # open in browser (fallback)
+            webbrowser.open(f'file://{tmp.name}')
 
     def closeEvent(self, event):
-        # try to remove temporary file if present
         try:
             if hasattr(self, '_tmpfile') and self._tmpfile:
                 os.unlink(self._tmpfile)
         except Exception:
             pass
         super().closeEvent(event)
+
+    def _on_save(self):
+        """Write current filter values to the project's metadata.json under cellborg-cli/."""
+        if not self._project_path:
+            QMessageBox.warning(self, "Save failed", "No project path provided; cannot save filters.")
+            return
+
+        proj = Path(self._project_path)
+        cfg_dir = proj / "cellborg-cli"
+        try:
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            meta_file = cfg_dir / "metadata.json"
+            meta = {}
+            if meta_file.exists():
+                try:
+                    with meta_file.open("r", encoding="utf-8") as fh:
+                        meta = json.load(fh) or {}
+                except Exception:
+                    meta = {}
+
+            # write filters under a `filters` key
+            filters = {
+                "nFeature_RNA_min": int(self.min_feat.value()),
+                "nFeature_RNA_max": int(self.max_feat.value()),
+                "pct_counts_mt_max": float(self.pct_mt.value()),
+            }
+            meta["filters"] = filters
+
+            with meta_file.open("w", encoding="utf-8") as fh:
+                json.dump(meta, fh, ensure_ascii=False, indent=2)
+
+            QMessageBox.information(self, "Saved", f"Filters saved to {meta_file}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", f"Failed to save filters: {e}")
 
 
 def main():
