@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
     QMessageBox, QScrollArea, QFrame, QHBoxLayout, QDialog, QLineEdit, QTextEdit,
-    QFormLayout, QDialogButtonBox, QSpinBox, QDoubleSpinBox
+    QFormLayout, QDialogButtonBox, QSpinBox, QDoubleSpinBox, QTreeWidget, QTreeWidgetItem
 )
 from PySide6.QtCore import Qt
 import json
@@ -106,6 +106,13 @@ class Dashboard(QWidget):
         self.desc_label.setWordWrap(True)
         detail_layout.addWidget(self.title_label)
         detail_layout.addWidget(self.desc_label)
+        # metadata display (read-only structured tree)
+        self.meta_view = QTreeWidget()
+        self.meta_view.setHeaderLabels(["Key", "Value"])
+        self.meta_view.setRootIsDecorated(True)
+        self.meta_view.setAlternatingRowColors(True)
+        self.meta_view.setMinimumHeight(140)
+        detail_layout.addWidget(self.meta_view)
         detail_layout.addStretch()
 
         # Action buttons
@@ -342,6 +349,39 @@ class Dashboard(QWidget):
         # also update the UI
         self.title_label.setText(title)
         self.desc_label.setText(desc)
+        # populate structured metadata tree
+        try:
+            self._populate_meta_view(meta)
+        except Exception:
+            # fallback: show string representation
+            self.meta_view.clear()
+            item = QTreeWidgetItem(["metadata", str(meta)])
+            self.meta_view.addTopLevelItem(item)
+
+    def _populate_meta_view(self, meta: dict):
+        """Populate the `self.meta_view` QTreeWidget with the metadata dict."""
+        self.meta_view.clear()
+
+        def add_node(parent, key, value):
+            if isinstance(value, dict):
+                node = QTreeWidgetItem([str(key), ""])
+                parent.addChild(node)
+                for k, v in value.items():
+                    add_node(node, k, v)
+            elif isinstance(value, list):
+                node = QTreeWidgetItem([str(key), "[list]"])
+                parent.addChild(node)
+                for i, v in enumerate(value):
+                    add_node(node, f"[{i}]", v)
+            else:
+                node = QTreeWidgetItem([str(key), str(value)])
+                parent.addChild(node)
+
+        root = self.meta_view.invisibleRootItem()
+        if not meta:
+            return
+        for k, v in meta.items():
+            add_node(root, k, v)
 
 
 class MetadataDialog(QDialog):
