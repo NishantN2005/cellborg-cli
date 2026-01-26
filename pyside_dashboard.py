@@ -12,9 +12,16 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 import json
 
+from qc_functions import read_10x_mtx, calculate_qc_metrics, find_species, SPECIES_TO_MT
+
 BASE_DIR = Path(__file__).resolve().parent
 PROJECTS_DIR = BASE_DIR / "projects"
 PROJECTS_DIR.mkdir(exist_ok=True)
+
+# Module-level selected project attributes (updated when a project is selected)
+SELECTED_PROJECT_NAME = None
+SELECTED_PROJECT_PATH = None
+SELECTED_PROJECT_METADATA = None
 
 
 class ProjectEntry(QFrame):
@@ -90,7 +97,7 @@ class Dashboard(QWidget):
         self.run_qc_btn = QPushButton("Run QC")
         self.run_analysis_btn = QPushButton("Run Analysis")
         # not wired yet (do nothing)
-        self.run_qc_btn.clicked.connect(lambda: None)
+        self.run_qc_btn.clicked.connect(self.run_qc)
         self.run_analysis_btn.clicked.connect(lambda: None)
         btns = QHBoxLayout()
         btns.addWidget(self.run_qc_btn)
@@ -105,6 +112,33 @@ class Dashboard(QWidget):
         root.addWidget(self.info)
 
         self.refresh()
+
+    def run_qc(self):
+        # Guard: ensure a project is selected
+        if not SELECTED_PROJECT_PATH:
+            QMessageBox.warning(self, "No project selected", "Please select a project on the left first.")
+            return
+
+        try:
+            adata = read_10x_mtx(SELECTED_PROJECT_PATH)
+        except Exception as e:
+            QMessageBox.critical(self, "Read failed", f"Failed to read project data: {e}")
+            return
+
+        # determine mt prefix from metadata species when available
+        mt = "MT-"
+        try:
+            species = SELECTED_PROJECT_METADATA.get("species") if SELECTED_PROJECT_METADATA else None
+            if species:
+                mt = SPECIES_TO_MT.get(species, mt)
+        except Exception:
+            mt = "MT-"
+
+        try:
+            calculate_qc_metrics(mt, adata)
+            QMessageBox.information(self, "QC", "QC completed (results not shown).")
+        except Exception as e:
+            QMessageBox.critical(self, "QC failed", f"QC calculation failed: {e}")
 
     def refresh(self):
         # Clear existing entries
@@ -188,9 +222,23 @@ class Dashboard(QWidget):
             meta = dlg.get_data()
 
             shutil.move(str(src), str(dest))
-            # write metadata.json inside moved folder
+            # create cellborg-cli subdir inside project for metadata/cache
             try:
-                with (Path(dest) / "metadata.json").open("w", encoding="utf-8") as fh:
+                cfg_dir = Path(dest) / "cellborg-cli"
+                cfg_dir.mkdir(parents=True, exist_ok=True)
+
+                # detect species using qc function (read features file inside moved folder)
+                try:
+                    features_path = Path(dest) / "features.tsv.gz"
+                    species = find_species(str(features_path))
+                except Exception as e:
+                    print(f"Could not determine species: {e}")
+                    species = None
+                if species:
+                    meta["species"] = species
+
+                # write metadata.json inside moved project's cellborg-cli folder
+                with (cfg_dir / "metadata.json").open("w", encoding="utf-8") as fh:
                     json.dump(meta, fh, ensure_ascii=False, indent=2)
             except Exception as e:
                 QMessageBox.warning(self, "Warning", f"Saved project but failed to write metadata: {e}")
@@ -208,18 +256,26 @@ class Dashboard(QWidget):
             self.desc_label.setText("")
             return
 
-        meta_file = p / "metadata.json"
+        # load metadata (from project/cellborg-cli/) and update global selected attributes
+        global SELECTED_PROJECT_NAME, SELECTED_PROJECT_PATH, SELECTED_PROJECT_METADATA
+        meta_file = p / "cellborg-cli" / "metadata.json"
         title = folder_name
         desc = ""
+        meta = {}
         if meta_file.exists():
             try:
                 with meta_file.open("r", encoding="utf-8") as fh:
-                    meta = json.load(fh)
+                    meta = json.load(fh) or {}
                     title = meta.get("title") or title
                     desc = meta.get("description") or ""
             except Exception:
-                pass
+                meta = {}
 
+        SELECTED_PROJECT_NAME = title
+        SELECTED_PROJECT_PATH = str(p)
+        SELECTED_PROJECT_METADATA = meta
+
+        # also update the UI
         self.title_label.setText(title)
         self.desc_label.setText(desc)
 
@@ -254,3 +310,18 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def get_selected_project_name():
+    """Return the currently selected project's title (or None)."""
+    return SELECTED_PROJECT_NAME
+
+
+def get_selected_project_path():
+    """Return the filesystem path to the currently selected project (or None)."""
+    return SELECTED_PROJECT_PATH
+
+
+def get_selected_project_metadata():
+    """Return the metadata dict for the currently selected project (or None)."""
+    return SELECTED_PROJECT_METADATA
