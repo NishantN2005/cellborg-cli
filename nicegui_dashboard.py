@@ -1,0 +1,184 @@
+from nicegui import ui, app
+import os
+import shutil
+import asyncio
+from pathlib import Path
+import json
+from datetime import datetime
+
+PROJECTS_DIR = Path('projects')
+SELECTED_PROJECT: dict | None = None
+
+def ensure_projects_dir() -> None:
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_projects() -> list[Path]:
+    ensure_projects_dir()
+    return [Path(e.path) for e in os.scandir(PROJECTS_DIR) if e.is_dir()]
+
+def unique_dest_folder(name: str) -> Path:
+    base = PROJECTS_DIR / name
+    if not base.exists():
+        return base
+    i = 1
+    while True:
+        cand = PROJECTS_DIR / f'{name}-{i}'
+        if not cand.exists():
+            return cand
+        i += 1
+
+def load_project_metadata(project_dir: Path) -> dict | None:
+    meta_path = project_dir / 'cellborg-cli' / 'metadata.json'
+    if not meta_path.exists():
+        return None
+    try:
+        data = json.loads(meta_path.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+def existing_titles() -> set[str]:
+    titles = set()
+    for p in get_projects():
+        md = load_project_metadata(p)
+        if md and md.get("project_title"):
+            titles.add(str(md["project_title"]).strip())
+    return titles
+
+async def choose_folder_via_native_file_dialog() -> Path | None:
+    if not getattr(app, 'native', None) or app.native.main_window is None:
+        ui.notify('Native window not available. Run with ui.run(native=True).', color='negative')
+        return None
+
+    try:
+        import webview  # pip install pywebview
+    except Exception as e:
+        ui.notify(f'pywebview not installed/available: {e}', color='negative')
+        return None
+
+    dialog_type = webview.FileDialog.OPEN if hasattr(webview, 'FileDialog') else webview.OPEN_DIALOG
+
+    files = await app.native.main_window.create_file_dialog(
+        dialog_type=dialog_type,
+        allow_multiple=False,
+        file_types=('All files (*.*)',),
+    )
+    if not files:
+        return None
+
+    file_path = Path(files[0])
+    if not file_path.exists():
+        ui.notify(f'File not found: {file_path}', color='negative')
+        return None
+
+    folder = file_path.parent
+    if not folder.is_dir():
+        ui.notify(f'Not a folder: {folder}', color='negative')
+        return None
+
+    return folder
+
+async def copy_folder_to_projects(src_folder: Path) -> Path:
+    ensure_projects_dir()
+    dest = unique_dest_folder(src_folder.name)
+
+    def do_copy():
+        shutil.copytree(str(src_folder), str(dest))
+
+    await asyncio.to_thread(do_copy)
+    return dest
+
+def select_project(md: dict) -> None:
+    global SELECTED_PROJECT
+    SELECTED_PROJECT = md
+    ui.notify(f"Selected project: {md.get('project_title', 'Unknown')}", color='info')
+    project_details.refresh()
+
+@ui.refreshable
+def projects_list():
+    for project in get_projects():
+        md = load_project_metadata(project)
+        if not md:
+            # show folder anyway, but mark missing metadata
+            ui.button(f'{project.name} (no metadata)', on_click=lambda p=project: ui.notify(str(p)))
+            continue
+
+        title = str(md.get('project_title') or project.name).strip() or project.name
+        ui.button(title, on_click=lambda m=md: select_project(m))
+
+@ui.refreshable
+def project_details():
+    ui.label('Project Details').style('font-size: 28px; font-weight: 700; color: #4ecda4; margin: 6px 0;')
+
+    if not SELECTED_PROJECT:
+        ui.label('Select a project to see details here.').style('color: #555;')
+        return
+
+    ui.label(f"Title: {SELECTED_PROJECT.get('project_title', '')}").style('color:#ddd; font-size: 18px;')
+    ui.label(f"Description: {SELECTED_PROJECT.get('project_description', '')}").style('color:#bbb;')
+    ui.label(f"Path: {SELECTED_PROJECT.get('project_path', '')}").style('color:#888; font-family: monospace;')
+
+async def add_project() -> None:
+    ui.notify('Select any file inside the folder you want to add.', color='info')
+    folder = await choose_folder_via_native_file_dialog()
+    if folder is None:
+        return
+
+    try:
+        dest = await copy_folder_to_projects(folder)
+    except Exception as e:
+        ui.notify(f'Failed to copy: {e}', color='negative')
+        return
+
+    # build dialog UI
+    dialog.clear()
+
+    with dialog, ui.card().classes('w-96'):
+        ui.label('Project Title')
+        title_input = ui.input(
+            validation=lambda v: 'Title already exists' if v and v.strip() in existing_titles() else None
+        ).props('autofocus')
+
+        ui.label('Project description')
+        desc_input = ui.textarea().style('height: 100px; width: 100%;')
+
+        def save():
+            md = {
+                "original_folder_name": folder.name,
+                "project_path": str(dest),
+                "project_title": (title_input.value or dest.name).strip(),
+                "project_description": desc_input.value or "",
+                "added_at": datetime.now().isoformat(),
+            }
+            (dest / "cellborg-cli").mkdir(parents=True, exist_ok=True)
+            (dest / "cellborg-cli" / "metadata.json").write_text(json.dumps(md, indent=4), encoding='utf-8')
+
+            ui.notify('Saved project metadata', color='positive')
+            dialog.close()
+            projects_list.refresh()
+
+        with ui.row().classes('justify-end w-full'):
+            ui.button('Cancel', on_click=dialog.close)
+            ui.button('Save', on_click=save)
+
+    dialog.open()
+
+ensure_projects_dir()
+
+with ui.dialog() as dialog:
+    pass
+
+dark = ui.dark_mode()
+dark.enable()
+
+with ui.row().style('padding:12px; width: 100%; gap: 12px; align-items: flex-start;'):
+    with ui.column().style('width: 520px; padding:20px; border:1px solid #333; border-radius:8px;'):
+        ui.label('Projects').style('font-size: 36px; font-weight: 800; color: #4ecda4;')
+        ui.button('Add New Project', on_click=add_project)
+        projects_list()
+
+    with ui.column().style('flex: 1; padding:20px; border:1px solid #333; border-radius:8px; min-height: 300px;'):
+        project_details()
+
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(host='127.0.0.1', port=8080, native=True)
