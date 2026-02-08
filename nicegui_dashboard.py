@@ -91,7 +91,7 @@ async def copy_folder_to_projects(src_folder: Path) -> Path:
 def select_project(md: dict) -> None:
     global SELECTED_PROJECT
     SELECTED_PROJECT = md
-    ui.notify(f"Selected project: {md.get('project_title', 'Unknown')}", color='info')
+    #ui.notify(f"Selected project: {md.get('project_title', 'Unknown')}", color='info')
     project_details.refresh()
 
 @ui.refreshable
@@ -171,13 +171,42 @@ with ui.dialog() as dialog:
 dark = ui.dark_mode()
 dark.enable()
 
-with ui.row().style('padding:12px; width: 100%; gap: 12px; align-items: flex-start;'):
-    with ui.column().style('width: 520px; padding:20px; border:1px solid #333; border-radius:8px;'):
+with ui.row().style(
+    '''
+    padding:12px;
+    width:100%;
+    height:95vh;      
+    box-sizing:border-box;
+    gap:12px;
+    overflow:hidden;    
+    '''
+):
+    with ui.column().style(
+        '''
+        width:520px;
+        height:100%;
+        padding:20px;
+        border:1px solid #e5e7eb;
+        border-radius:8px;
+        box-shadow:0 1px 3px rgba(0,0,0,0.06);
+        overflow-y:auto; 
+        '''
+    ):  
         ui.label('Projects').style('font-size: 36px; font-weight: 800; color: #4ecda4;')
         ui.button('Add New Project', on_click=add_project)
         projects_list()
 
-    with ui.column().style('flex: 1; padding:20px; border:1px solid #333; border-radius:8px; min-height: 300px;'):
+    with ui.column().style(
+        '''
+        flex:1;
+        height:100%;
+        padding:20px;
+        border:1px solid #e5e7eb;
+        border-radius:8px;
+        box-shadow:0 1px 3px rgba(0,0,0,0.06);
+        overflow-y:auto;
+        '''
+    ):
         project_details()
 
 if __name__ in {"__main__", "__mp_main__"}:
