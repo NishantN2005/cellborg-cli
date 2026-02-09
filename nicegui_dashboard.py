@@ -369,14 +369,156 @@ def qc_page():
         ui.notify(f"Could not load violin plot data: {e}", color='negative')
         return
 
-    # Layout: 3 charts in a responsive row
-    with ui.row().classes('w-full').style('gap:12px; flex-wrap: wrap;'):
-        with ui.card().style('flex: 1; min-width: 320px;'):
-            ui.plotly(violin_figure(a1, 'n_genes'))
-        with ui.card().style('flex: 1; min-width: 320px;'):
-            ui.plotly(violin_figure(a2, 'total_counts'))
-        with ui.card().style('flex: 1; min-width: 320px;'):
-            ui.plotly(violin_figure(a3, 'pct_counts_mt'))
+    import numpy as np
+    import plotly.graph_objects as go
+
+    def finite_min_max(arr):
+        v = np.array(arr, dtype=float)
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            return 0.0, 1.0
+        lo, hi = float(v.min()), float(v.max())
+        if hi <= lo:
+            hi = lo + 1.0
+        return lo, hi
+
+    def make_violin_with_lines(values, title, y_min, y_max):
+        v = np.array(values, dtype=float)
+        v = v[np.isfinite(v)]
+
+        fig = go.Figure()
+        fig.add_trace(go.Violin(
+            y=v,
+            box_visible=True,
+            meanline_visible=True,
+            points='outliers',
+            name=title,
+        ))
+
+        # two horizontal lines as editable shapes
+        fig.update_layout(
+            title=dict(text=title, x=0.5),
+            height=520,
+            margin=dict(l=25, r=25, t=55, b=20),
+            xaxis=dict(showticklabels=False),
+
+            # IMPORTANT: allow editing shapes
+            dragmode='pan',
+            newshape=dict(line=dict(width=2)),  # not required but fine
+
+            shapes=[
+                dict(
+                    type="line",
+                    xref="paper", x0=0, x1=1,  # full width
+                    yref="y", y0=y_min, y1=y_min,
+                    line=dict(width=3),
+                    name="min_line",
+                ),
+                dict(
+                    type="line",
+                    xref="paper", x0=0, x1=1,
+                    yref="y", y0=y_max, y1=y_max,
+                    line=dict(width=3),
+                    name="max_line",
+                ),
+            ],
+            # This enables dragging lines in the modebar (shape editing)
+            # Users can click-drag the line once “Edit shape” is enabled (modebar).
+            # We'll also offer numeric inputs as guaranteed control.
+        )
+        return fig
+
+    def set_line(fig, idx: int, y: float):
+        # idx 0 = min line, idx 1 = max line
+        fig.layout.shapes[idx].y0 = y
+        fig.layout.shapes[idx].y1 = y
+
+    def get_line(fig, idx: int) -> float:
+        return float(fig.layout.shapes[idx].y0)
+
+    def qc_tile(metric: str, values: list[float]):
+        data_min, data_max = finite_min_max(values)
+        y_min = data_min
+        y_max = data_max
+
+        with ui.card().style('width: 560px; padding: 16px;'):
+            fig = make_violin_with_lines(values, metric, y_min, y_max)
+            plot = ui.plotly(fig).style('width:100%;')
+
+            # numeric inputs (guaranteed) - lines move when these change
+            with ui.row().classes('w-full items-center').style('gap: 12px; margin-top: 10px;'):
+                min_in = ui.number('Min line', value=y_min, format='%.3f').style('flex:1;')
+                max_in = ui.number('Max line', value=y_max, format='%.3f').style('flex:1;')
+
+            def apply_from_inputs():
+                nonlocal y_min, y_max
+                y_min = float(min_in.value)
+                y_max = float(max_in.value)
+
+                # keep ordering
+                if y_min > y_max:
+                    y_min = y_max
+                    min_in.value = y_min
+
+                # update shapes
+                set_line(plot.figure, 0, y_min)
+                set_line(plot.figure, 1, y_max)
+
+                # optionally clamp view range too (comment out if you don't want it)
+                plot.figure.update_yaxes(range=[y_min, y_max])
+
+                plot.update()
+                print(f'[{metric}] min={y_min} max={y_max}')
+
+            min_in.on('change', lambda e: apply_from_inputs())
+            max_in.on('change', lambda e: apply_from_inputs())
+
+            # Try to capture line drags (when Plotly emits relayout events)
+            # This fires when shapes move and Plotly updates layout.shapes[..].y0/y1
+            def on_relayout(e):
+                # e.args is usually a dict of changed layout props
+                payload = getattr(e, 'args', None)
+                if not isinstance(payload, dict):
+                    return
+
+                # Look for any shapes y updates
+                # Common keys:
+                # 'shapes[0].y0', 'shapes[0].y1', 'shapes[1].y0', ...
+                new_min = None
+                new_max = None
+
+                for k, v in payload.items():
+                    if k in ('shapes[0].y0', 'shapes[0].y1'):
+                        try: new_min = float(v)
+                        except Exception: pass
+                    if k in ('shapes[1].y0', 'shapes[1].y1'):
+                        try: new_max = float(v)
+                        except Exception: pass
+
+                changed = False
+                if new_min is not None:
+                    min_in.value = new_min
+                    changed = True
+                if new_max is not None:
+                    max_in.value = new_max
+                    changed = True
+
+                if changed:
+                    # enforce ordering + print + (optionally) clamp axis
+                    apply_from_inputs()
+
+            # Depending on NiceGUI version, one of these will work:
+            plot.on('plotly_relayout', on_relayout)
+            plot.on('plotly_relayouting', on_relayout)
+
+    # --- render 3 tiles centered ---
+    with ui.row().classes('w-full justify-center').style('gap:24px; padding-top:16px; flex-wrap:wrap;'):
+        qc_tile('n_genes', a1)
+        qc_tile('total_counts', a2)
+        qc_tile('pct_counts_mt', a3)
+
+
+
 
     ui.separator().style('opacity:0.25; margin: 12px 0;')
     ui.button('Back to Projects', on_click=lambda: ui.navigate.to('/')).props('flat')
