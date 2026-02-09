@@ -5,10 +5,21 @@ import asyncio
 from pathlib import Path
 import json
 from datetime import datetime
+import numpy as np
+import plotly.graph_objects as go
 
-from qc_functions import read_10x_mtx, find_species, calculate_qc_metrics,voilin_plot, MT_TO_SPECIES, SPECIES_TO_MT  
+from qc_functions import (
+    read_10x_mtx,
+    find_species,
+    calculate_qc_metrics,
+    voilin_plot,
+    gate_adata,
+    scrublet,
+    MT_TO_SPECIES,
+    SPECIES_TO_MT,
+)
 
-PROJECTS_DIR = Path('projects')
+PROJECTS_DIR = Path("projects")
 SELECTED_PROJECT: dict | None = None
 
 
@@ -30,18 +41,18 @@ def unique_dest_folder(name: str) -> Path:
         return base
     i = 1
     while True:
-        cand = PROJECTS_DIR / f'{name}-{i}'
+        cand = PROJECTS_DIR / f"{name}-{i}"
         if not cand.exists():
             return cand
         i += 1
 
 
 def load_project_metadata(project_dir: Path) -> dict | None:
-    meta_path = project_dir / 'cellborg-cli' / 'metadata.json'
+    meta_path = project_dir / "cellborg-cli" / "metadata.json"
     if not meta_path.exists():
         return None
     try:
-        data = json.loads(meta_path.read_text(encoding='utf-8'))
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else None
     except Exception:
         return None
@@ -55,15 +66,10 @@ def existing_titles() -> set[str]:
             titles.add(str(md["project_title"]).strip())
     return titles
 
-#------------------------------
-# QC functions
-#------------------------------
-from pathlib import Path
-import json
-import numpy as np
-import plotly.graph_objects as go
-from nicegui import ui
 
+# ------------------------------
+# QC functions
+# ------------------------------
 def load_violin_arrays(project_path: str | Path):
     hc_path = Path(project_path) / "cellborg-cli" / "highcharts_data.json"
     if not hc_path.exists():
@@ -85,30 +91,41 @@ def load_violin_arrays(project_path: str | Path):
                 tc = v.get("total_counts")
                 mt = v.get("pct_counts_mt")
                 if ng is not None:
-                    try: a1.append(float(ng))
-                    except Exception: pass
+                    try:
+                        a1.append(float(ng))
+                    except Exception:
+                        pass
                 if tc is not None:
-                    try: a2.append(float(tc))
-                    except Exception: pass
+                    try:
+                        a2.append(float(tc))
+                    except Exception:
+                        pass
                 if mt is not None:
-                    try: a3.append(float(mt))
-                    except Exception: pass
+                    try:
+                        a3.append(float(mt))
+                    except Exception:
+                        pass
 
         # Layout 1: {"n_genes_by_counts":[...], "total_counts":[...], "pct_counts_mt":[...]}
         else:
-            # accept common key variants
             k1 = "n_genes_by_counts" if "n_genes_by_counts" in hc else "n_genes"
             k2 = "total_counts"
             k3 = "pct_counts_mt"
             for x in hc.get(k1, []) or []:
-                try: a1.append(float(x))
-                except Exception: pass
+                try:
+                    a1.append(float(x))
+                except Exception:
+                    pass
             for x in hc.get(k2, []) or []:
-                try: a2.append(float(x))
-                except Exception: pass
+                try:
+                    a2.append(float(x))
+                except Exception:
+                    pass
             for x in hc.get(k3, []) or []:
-                try: a3.append(float(x))
-                except Exception: pass
+                try:
+                    a3.append(float(x))
+                except Exception:
+                    pass
 
     return a1, a2, a3
 
@@ -117,13 +134,15 @@ def violin_figure(values, title: str, x_label: str = ""):
     v = np.array(values, dtype=float)
     v = v[np.isfinite(v)]
     fig = go.Figure()
-    fig.add_trace(go.Violin(
-        y=v,
-        box_visible=True,
-        meanline_visible=True,
-        points="outliers",
-        name=title,
-    ))
+    fig.add_trace(
+        go.Violin(
+            y=v,
+            box_visible=True,
+            meanline_visible=True,
+            points="outliers",
+            name=title,
+        )
+    )
     fig.update_layout(
         title=title,
         height=320,
@@ -133,38 +152,99 @@ def violin_figure(values, title: str, x_label: str = ""):
     return fig
 
 
+# ------------------------------
+# QC SAVE (FIXED)
+# ------------------------------
+def _as_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def thresholds_elements_to_values(qc_thresholds: dict) -> dict:
+    """
+    Converts your QC_THRESHOLDS (which currently stores ui.number elements)
+    into plain floats so background threads + gate_adata don't see UI objects.
+    """
+    out: dict = {}
+    for metric, bundle in (qc_thresholds or {}).items():
+        min_el = bundle.get("min_input")
+        max_el = bundle.get("max_input")
+        out[metric] = {
+            "min": _as_float(getattr(min_el, "value", None)),
+            "max": _as_float(getattr(max_el, "value", None)),
+        }
+    return out
+
+
+async def save_qc_async(*, adata, qc_thresholds_elements: dict, project_path: str, ui_slot, save_button=None):
+    """
+    Runs gating + scrublet + write in a background thread (so websocket stays alive),
+    then notifies + navigates on the UI thread inside ui_slot.
+    """
+    try:
+        thresholds_values = thresholds_elements_to_values(qc_thresholds_elements)
+
+        def work():
+            a = gate_adata(adata, thresholds_values)
+            scrublet(a, 0.065)
+            out_dir = Path(project_path) / "cellborg-cli"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / "adata_qc.h5ad"
+            a.write(out_file)
+            return str(out_file)
+
+        out_file = await asyncio.to_thread(work)
+
+        with ui_slot:
+            ui.notify(f"Saved QC dataset → {out_file}", color="positive")
+            ui.navigate.to("/")
+
+    except Exception as e:
+        with ui_slot:
+            ui.notify(f"QC save failed: {e}", color="negative")
+        if save_button is not None:
+            try:
+                save_button.enable()
+            except Exception:
+                pass
+
+
 # -----------------------------
 # native folder picker
 # -----------------------------
 async def choose_folder_via_native_file_dialog() -> Path | None:
-    if not getattr(app, 'native', None) or app.native.main_window is None:
-        ui.notify('Native window not available. Run with ui.run(native=True).', color='negative')
+    if not getattr(app, "native", None) or app.native.main_window is None:
+        ui.notify("Native window not available. Run with ui.run(native=True).", color="negative")
         return None
 
     try:
         import webview  # pip install pywebview
     except Exception as e:
-        ui.notify(f'pywebview not installed/available: {e}', color='negative')
+        ui.notify(f"pywebview not installed/available: {e}", color="negative")
         return None
 
-    dialog_type = webview.FileDialog.OPEN if hasattr(webview, 'FileDialog') else webview.OPEN_DIALOG
+    dialog_type = webview.FileDialog.OPEN if hasattr(webview, "FileDialog") else webview.OPEN_DIALOG
 
     files = await app.native.main_window.create_file_dialog(
         dialog_type=dialog_type,
         allow_multiple=False,
-        file_types=('All files (*.*)',),
+        file_types=("All files (*.*)",),
     )
     if not files:
         return None
 
     file_path = Path(files[0])
     if not file_path.exists():
-        ui.notify(f'File not found: {file_path}', color='negative')
+        ui.notify(f"File not found: {file_path}", color="negative")
         return None
 
     folder = file_path.parent
     if not folder.is_dir():
-        ui.notify(f'Not a folder: {folder}', color='negative')
+        ui.notify(f"Not a folder: {folder}", color="negative")
         return None
 
     return folder
@@ -195,32 +275,32 @@ def projects_list():
     for project in get_projects():
         md = load_project_metadata(project)
         if not md:
-            ui.button(f'{project.name} (no metadata)', on_click=lambda p=project: ui.notify(str(p)))
+            ui.button(f"{project.name} (no metadata)", on_click=lambda p=project: ui.notify(str(p)))
             continue
 
-        title = str(md.get('project_title') or project.name).strip() or project.name
+        title = str(md.get("project_title") or project.name).strip() or project.name
         ui.button(title, on_click=lambda m=md: select_project(m))
 
 
 @ui.refreshable
 def project_details():
-    ui.label('Project Details').style('font-size: 28px; font-weight: 700; color: #4ecda4; margin: 6px 0;')
+    ui.label("Project Details").style("font-size: 28px; font-weight: 700; color: #4ecda4; margin: 6px 0;")
 
     if not SELECTED_PROJECT:
-        ui.label('Select a project to see details here.').style('color: #555;')
+        ui.label("Select a project to see details here.").style("color: #555;")
         return
 
-    ui.label(f"Title: {SELECTED_PROJECT.get('project_title', '')}").style('color:#ddd; font-size: 18px;')
-    ui.label(f"Description: {SELECTED_PROJECT.get('project_description', '')}").style('color:#bbb;')
+    ui.label(f"Title: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd; font-size: 18px;")
+    ui.label(f"Description: {SELECTED_PROJECT.get('project_description', '')}").style("color:#bbb;")
 
     if SELECTED_PROJECT:
-        with ui.row().classes('w-full').style('gap:12px; margin-top:12px;'):
-            ui.button('Run QC', on_click=lambda: ui.navigate.to('/qc')).style('flex:1;')
-            ui.button('Run Analysis').style('flex:1;')
+        with ui.row().classes("w-full").style("gap:12px; margin-top:12px;"):
+            ui.button("Run QC", on_click=lambda: ui.navigate.to("/qc")).style("flex:1;")
+            ui.button("Run Analysis").style("flex:1;")
 
 
 async def add_project() -> None:
-    ui.notify('Select any file inside the folder you want to add.', color='info')
+    ui.notify("Select any file inside the folder you want to add.", color="info")
     folder = await choose_folder_via_native_file_dialog()
     if folder is None:
         return
@@ -229,19 +309,19 @@ async def add_project() -> None:
         dest = await copy_folder_to_projects(folder)
         species = find_species(dest / "features.tsv.gz")
     except Exception as e:
-        ui.notify(f'Failed to copy: {e}', color='negative')
+        ui.notify(f"Failed to copy: {e}", color="negative")
         return
 
     dialog.clear()
 
-    with dialog, ui.card().classes('w-96'):
-        ui.label('Project Title')
-        title_input = ui.input(
-            validation=lambda v: 'Title already exists' if v and v.strip() in existing_titles() else None
-        ).props('autofocus')
+    with dialog, ui.card().classes("w-96"):
+        ui.label("Project Title")
+        title_input = ui.input(validation=lambda v: "Title already exists" if v and v.strip() in existing_titles() else None).props(
+            "autofocus"
+        )
 
-        ui.label('Project description')
-        desc_input = ui.textarea().style('height: 100px; width: 100%;')
+        ui.label("Project description")
+        desc_input = ui.textarea().style("height: 100px; width: 100%;")
 
         def save():
             md = {
@@ -253,15 +333,15 @@ async def add_project() -> None:
                 "added_at": datetime.now().isoformat(),
             }
             (dest / "cellborg-cli").mkdir(parents=True, exist_ok=True)
-            (dest / "cellborg-cli" / "metadata.json").write_text(json.dumps(md, indent=4), encoding='utf-8')
+            (dest / "cellborg-cli" / "metadata.json").write_text(json.dumps(md, indent=4), encoding="utf-8")
 
-            ui.notify('Saved project metadata', color='positive')
+            ui.notify("Saved project metadata", color="positive")
             dialog.close()
             projects_list.refresh()
 
-        with ui.row().classes('justify-end w-full'):
-            ui.button('Cancel', on_click=dialog.close)
-            ui.button('Save', on_click=save)
+        with ui.row().classes("justify-end w-full"):
+            ui.button("Cancel", on_click=dialog.close)
+            ui.button("Save", on_click=save)
 
     dialog.open()
 
@@ -269,12 +349,11 @@ async def add_project() -> None:
 # -----------------------------
 # Pages
 # -----------------------------
-@ui.page('/')
+@ui.page("/")
 def dashboard_page():
     ensure_projects_dir()
 
     with ui.dialog() as d:
-        # keep a global ref so add_project can use it
         global dialog
         dialog = d
 
@@ -282,17 +361,17 @@ def dashboard_page():
     dark.enable()
 
     with ui.row().style(
-        '''
+        """
         padding:12px;
         width:100%;
         height:95vh;
         box-sizing:border-box;
         gap:12px;
         overflow:hidden;
-        '''
+        """
     ):
         with ui.column().style(
-            '''
+            """
             width:520px;
             height:100%;
             padding:20px;
@@ -300,14 +379,14 @@ def dashboard_page():
             border-radius:8px;
             box-shadow:0 1px 3px rgba(0,0,0,0.06);
             overflow-y:auto;
-            '''
+            """
         ):
-            ui.label('Projects').style('font-size: 36px; font-weight: 800; color: #4ecda4;')
-            ui.button('Add New Project', on_click=add_project)
+            ui.label("Projects").style("font-size: 36px; font-weight: 800; color: #4ecda4;")
+            ui.button("Add New Project", on_click=add_project)
             projects_list()
 
         with ui.column().style(
-            '''
+            """
             flex:1;
             height:100%;
             padding:20px;
@@ -315,36 +394,35 @@ def dashboard_page():
             border-radius:8px;
             box-shadow:0 1px 3px rgba(0,0,0,0.06);
             overflow-y:auto;
-            '''
+            """
         ):
             project_details()
 
 
-@ui.page('/qc')
+@ui.page("/qc")
 def qc_page():
     SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
+    QC_THRESHOLDS = {}
+
     if not SELECTED_PROJECT_PATH:
-        ui.label('No project selected. Go back and select one.').style('color:#fbbf24;')
-        ui.button('Back to Projects', on_click=lambda: ui.navigate.to('/')).props('flat')
+        ui.label("No project selected. Go back and select one.").style("color:#fbbf24;")
+        ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
         return
 
     dark = ui.dark_mode()
     dark.enable()
 
-    ui.label('QC Runner').style('font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;')
-    ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style('color:#ddd;')
-    ui.label(SELECTED_PROJECT.get('project_description', '')).style('color:#bbb;')
+    ui.label("QC Runner").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
+    ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
+    ui.label(SELECTED_PROJECT.get("project_description", "")).style("color:#bbb;")
 
-    ui.separator().style('opacity:0.25; margin: 12px 0;')
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
 
-    # ---- Run your QC pipeline (optional) ----
-    # If you do heavy compute here, strongly consider running it in a background task
-    # and showing a spinner; but for now keeping your structure.
     try:
         adata = read_10x_mtx(SELECTED_PROJECT_PATH)
     except Exception as e:
-        ui.notify(f"Failed to read project data: {e}", color='negative')
-        ui.button('Back to Projects', on_click=lambda: ui.navigate.to('/')).props('flat')
+        ui.notify(f"Failed to read project data: {e}", color="negative")
+        ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
         return
 
     mt = "MT-"
@@ -357,20 +435,16 @@ def qc_page():
 
     try:
         calculate_qc_metrics(mt, adata)
-        voilin_plot(adata, SELECTED_PROJECT_PATH)  # (your function that writes highcharts_data.json)
+        voilin_plot(adata, SELECTED_PROJECT_PATH)
     except Exception as e:
-        ui.notify(f"QC metrics failed: {e}", color='negative')
+        ui.notify(f"QC metrics failed: {e}", color="negative")
         return
 
-    # ---- Render graphs from highcharts_data.json ----
     try:
         a1, a2, a3 = load_violin_arrays(SELECTED_PROJECT_PATH)
     except Exception as e:
-        ui.notify(f"Could not load violin plot data: {e}", color='negative')
+        ui.notify(f"Could not load violin plot data: {e}", color="negative")
         return
-
-    import numpy as np
-    import plotly.graph_objects as go
 
     def finite_min_max(arr):
         v = np.array(arr, dtype=float)
@@ -387,49 +461,54 @@ def qc_page():
         v = v[np.isfinite(v)]
 
         fig = go.Figure()
-        fig.add_trace(go.Violin(
-            y=v,
-            box_visible=True,
-            meanline_visible=True,
-            points='outliers',
-            name=title,
-        ))
+        fig.add_trace(
+            go.Violin(
+                y=v,
+                box_visible=True,
+                meanline_visible=True,
+                points="outliers",
+                name=title,
+            )
+        )
 
-        # two horizontal lines as editable shapes
         fig.update_layout(
             title=dict(text=title, x=0.5),
             height=520,
             margin=dict(l=25, r=25, t=55, b=20),
             xaxis=dict(showticklabels=False),
 
-            # IMPORTANT: allow editing shapes
-            dragmode='pan',
-            newshape=dict(line=dict(width=2)),  # not required but fine
+            # (left exactly as you had it)
+            dragmode="pan",
+            newshape=dict(line=dict(width=2)),
 
             shapes=[
                 dict(
                     type="line",
-                    xref="paper", x0=0, x1=1,  # full width
-                    yref="y", y0=y_min, y1=y_min,
+                    xref="paper",
+                    x0=0,
+                    x1=1,
+                    yref="y",
+                    y0=y_min,
+                    y1=y_min,
                     line=dict(width=3),
                     name="min_line",
                 ),
                 dict(
                     type="line",
-                    xref="paper", x0=0, x1=1,
-                    yref="y", y0=y_max, y1=y_max,
+                    xref="paper",
+                    x0=0,
+                    x1=1,
+                    yref="y",
+                    y0=y_max,
+                    y1=y_max,
                     line=dict(width=3),
                     name="max_line",
                 ),
             ],
-            # This enables dragging lines in the modebar (shape editing)
-            # Users can click-drag the line once “Edit shape” is enabled (modebar).
-            # We'll also offer numeric inputs as guaranteed control.
         )
         return fig
 
     def set_line(fig, idx: int, y: float):
-        # idx 0 = min line, idx 1 = max line
         fig.layout.shapes[idx].y0 = y
         fig.layout.shapes[idx].y1 = y
 
@@ -441,59 +520,59 @@ def qc_page():
         y_min = data_min
         y_max = data_max
 
-        with ui.card().style('width: 560px; padding: 16px;'):
+        with ui.card().style("width: 560px; padding: 16px;"):
             fig = make_violin_with_lines(values, metric, y_min, y_max)
-            plot = ui.plotly(fig).style('width:100%;')
+            plot = ui.plotly(fig).style("width:100%;")
 
-            # numeric inputs (guaranteed) - lines move when these change
-            with ui.row().classes('w-full items-center').style('gap: 12px; margin-top: 10px;'):
-                min_in = ui.number('Min line', value=y_min, format='%.3f').style('flex:1;')
-                max_in = ui.number('Max line', value=y_max, format='%.3f').style('flex:1;')
+            with ui.row().classes("w-full items-center").style("gap: 12px; margin-top: 10px;"):
+                min_in = ui.number("Min line", value=y_min, format="%.3f").style("flex:1;")
+                max_in = ui.number("Max line", value=y_max, format="%.3f").style("flex:1;")
+
+            QC_THRESHOLDS[metric] = {
+                "min_input": min_in,
+                "max_input": max_in,
+                "plot": plot,
+            }
 
             def apply_from_inputs():
                 nonlocal y_min, y_max
                 y_min = float(min_in.value)
                 y_max = float(max_in.value)
 
-                # keep ordering
                 if y_min > y_max:
                     y_min = y_max
                     min_in.value = y_min
 
-                # update shapes
                 set_line(plot.figure, 0, y_min)
                 set_line(plot.figure, 1, y_max)
 
-                # optionally clamp view range too (comment out if you don't want it)
                 plot.figure.update_yaxes(range=[y_min, y_max])
 
                 plot.update()
-                print(f'[{metric}] min={y_min} max={y_max}')
+                print(f"[{metric}] min={y_min} max={y_max}")
 
-            min_in.on('change', lambda e: apply_from_inputs())
-            max_in.on('change', lambda e: apply_from_inputs())
+            min_in.on("change", lambda e: apply_from_inputs())
+            max_in.on("change", lambda e: apply_from_inputs())
 
-            # Try to capture line drags (when Plotly emits relayout events)
-            # This fires when shapes move and Plotly updates layout.shapes[..].y0/y1
             def on_relayout(e):
-                # e.args is usually a dict of changed layout props
-                payload = getattr(e, 'args', None)
+                payload = getattr(e, "args", None)
                 if not isinstance(payload, dict):
                     return
 
-                # Look for any shapes y updates
-                # Common keys:
-                # 'shapes[0].y0', 'shapes[0].y1', 'shapes[1].y0', ...
                 new_min = None
                 new_max = None
 
                 for k, v in payload.items():
-                    if k in ('shapes[0].y0', 'shapes[0].y1'):
-                        try: new_min = float(v)
-                        except Exception: pass
-                    if k in ('shapes[1].y0', 'shapes[1].y1'):
-                        try: new_max = float(v)
-                        except Exception: pass
+                    if k in ("shapes[0].y0", "shapes[0].y1"):
+                        try:
+                            new_min = float(v)
+                        except Exception:
+                            pass
+                    if k in ("shapes[1].y0", "shapes[1].y1"):
+                        try:
+                            new_max = float(v)
+                        except Exception:
+                            pass
 
                 changed = False
                 if new_min is not None:
@@ -504,29 +583,45 @@ def qc_page():
                     changed = True
 
                 if changed:
-                    # enforce ordering + print + (optionally) clamp axis
                     apply_from_inputs()
 
-            # Depending on NiceGUI version, one of these will work:
-            plot.on('plotly_relayout', on_relayout)
-            plot.on('plotly_relayouting', on_relayout)
+            plot.on("plotly_relayout", on_relayout)
+            plot.on("plotly_relayouting", on_relayout)
 
-    # --- render 3 tiles centered ---
-    with ui.row().classes('w-full justify-center').style('gap:24px; padding-top:16px; flex-wrap:wrap;'):
-        qc_tile('n_genes', a1)
-        qc_tile('total_counts', a2)
-        qc_tile('pct_counts_mt', a3)
+    with ui.row().classes("w-full justify-center").style("gap:24px; padding-top:16px; flex-wrap:wrap;"):
+        qc_tile("n_genes", a1)
+        qc_tile("total_counts", a2)
+        qc_tile("pct_counts_mt", a3)
 
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
 
+    # IMPORTANT: define 'actions' container (you were using it but never created it)
+    actions = ui.row().classes("w-full").style("gap:12px;")
+    with actions:
+        ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat").style("flex:1")
 
+        save_btn = ui.button("Save").props("flat").style("flex:1")
 
-    ui.separator().style('opacity:0.25; margin: 12px 0;')
-    ui.button('Back to Projects', on_click=lambda: ui.navigate.to('/')).props('flat')
+        def on_save_click():
+            save_btn.disable()
+            with actions:
+                ui.notify("Saving QC…", color="info")
 
+            asyncio.create_task(
+                save_qc_async(
+                    adata=adata,
+                    qc_thresholds_elements=QC_THRESHOLDS,  # <- UI elements dict (we convert to floats inside)
+                    project_path=SELECTED_PROJECT["project_path"],
+                    ui_slot=actions,  # <- explicit UI slot
+                    save_button=save_btn,
+                )
+            )
+
+        save_btn.on("click", lambda e: on_save_click())
 
 
 # -----------------------------
 # run
 # -----------------------------
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(host='127.0.0.1', port=8080, native=True)
+    ui.run(host="127.0.0.1", port=8080, native=True)

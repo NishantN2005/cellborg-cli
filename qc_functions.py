@@ -127,3 +127,25 @@ def voilin_plot(adata, selected_project_path):
     jitter=0.4,
     multi_panel=True,
 ) """
+
+
+def gate_adata(adata, thresholds):
+    print("------ gate_adata begins -------")
+    print(f"Filtering adata with: {thresholds}")
+    initial_cell_count = adata.n_obs
+    adata = adata[
+        (adata.obs["n_genes_by_counts"] >= thresholds["n_genes"]["min"]) &
+        (adata.obs["n_genes_by_counts"] <= thresholds["n_genes"]["max"]) &
+        (adata.obs["total_counts"] >= thresholds["total_counts"]["min"]) &
+        (adata.obs["total_counts"] <= thresholds["total_counts"]["max"]) &
+        (adata.obs["pct_counts_mt"] >= thresholds["pct_counts_mt"]["min"]) &
+        (adata.obs["pct_counts_mt"] <= thresholds["pct_counts_mt"]["max"])
+    ].copy()
+    final_cell_count = adata.n_obs
+    print(f"Filtered adata from {initial_cell_count} to {final_cell_count} cells")
+    return adata
+
+def scrublet(adata, exp_doublet_rate = 0.065):
+    print("------ scrublet begins -------")
+    sc.pp.scrublet(adata, expected_doublet_rate = exp_doublet_rate)
+    print(f"Identified {adata.obs['doublet_score'].sum()} doublets with scrublet")
