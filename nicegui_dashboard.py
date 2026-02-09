@@ -9,12 +9,18 @@ from datetime import datetime
 PROJECTS_DIR = Path('projects')
 SELECTED_PROJECT: dict | None = None
 
+
+# -----------------------------
+# filesystem / metadata helpers
+# -----------------------------
 def ensure_projects_dir() -> None:
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def get_projects() -> list[Path]:
     ensure_projects_dir()
     return [Path(e.path) for e in os.scandir(PROJECTS_DIR) if e.is_dir()]
+
 
 def unique_dest_folder(name: str) -> Path:
     base = PROJECTS_DIR / name
@@ -27,6 +33,7 @@ def unique_dest_folder(name: str) -> Path:
             return cand
         i += 1
 
+
 def load_project_metadata(project_dir: Path) -> dict | None:
     meta_path = project_dir / 'cellborg-cli' / 'metadata.json'
     if not meta_path.exists():
@@ -37,6 +44,7 @@ def load_project_metadata(project_dir: Path) -> dict | None:
     except Exception:
         return None
 
+
 def existing_titles() -> set[str]:
     titles = set()
     for p in get_projects():
@@ -45,6 +53,10 @@ def existing_titles() -> set[str]:
             titles.add(str(md["project_title"]).strip())
     return titles
 
+
+# -----------------------------
+# native folder picker
+# -----------------------------
 async def choose_folder_via_native_file_dialog() -> Path | None:
     if not getattr(app, 'native', None) or app.native.main_window is None:
         ui.notify('Native window not available. Run with ui.run(native=True).', color='negative')
@@ -78,6 +90,7 @@ async def choose_folder_via_native_file_dialog() -> Path | None:
 
     return folder
 
+
 async def copy_folder_to_projects(src_folder: Path) -> Path:
     ensure_projects_dir()
     dest = unique_dest_folder(src_folder.name)
@@ -88,23 +101,27 @@ async def copy_folder_to_projects(src_folder: Path) -> Path:
     await asyncio.to_thread(do_copy)
     return dest
 
+
+# -----------------------------
+# UI callbacks
+# -----------------------------
 def select_project(md: dict) -> None:
     global SELECTED_PROJECT
     SELECTED_PROJECT = md
-    #ui.notify(f"Selected project: {md.get('project_title', 'Unknown')}", color='info')
     project_details.refresh()
+
 
 @ui.refreshable
 def projects_list():
     for project in get_projects():
         md = load_project_metadata(project)
         if not md:
-            # show folder anyway, but mark missing metadata
             ui.button(f'{project.name} (no metadata)', on_click=lambda p=project: ui.notify(str(p)))
             continue
 
         title = str(md.get('project_title') or project.name).strip() or project.name
         ui.button(title, on_click=lambda m=md: select_project(m))
+
 
 @ui.refreshable
 def project_details():
@@ -116,7 +133,11 @@ def project_details():
 
     ui.label(f"Title: {SELECTED_PROJECT.get('project_title', '')}").style('color:#ddd; font-size: 18px;')
     ui.label(f"Description: {SELECTED_PROJECT.get('project_description', '')}").style('color:#bbb;')
-    ui.label(f"Path: {SELECTED_PROJECT.get('project_path', '')}").style('color:#888; font-family: monospace;')
+
+    with ui.row().classes('w-full').style('gap:12px; margin-top:12px;'):
+        ui.button('Run QC', on_click=lambda: ui.navigate.to('/qc')).style('flex:1;')
+        ui.button('Run Analysis').style('flex:1;')
+
 
 async def add_project() -> None:
     ui.notify('Select any file inside the folder you want to add.', color='info')
@@ -130,7 +151,6 @@ async def add_project() -> None:
         ui.notify(f'Failed to copy: {e}', color='negative')
         return
 
-    # build dialog UI
     dialog.clear()
 
     with dialog, ui.card().classes('w-96'):
@@ -163,51 +183,79 @@ async def add_project() -> None:
 
     dialog.open()
 
-ensure_projects_dir()
 
-with ui.dialog() as dialog:
-    pass
+# -----------------------------
+# Pages
+# -----------------------------
+@ui.page('/')
+def dashboard_page():
+    ensure_projects_dir()
 
-dark = ui.dark_mode()
-dark.enable()
+    with ui.dialog() as d:
+        # keep a global ref so add_project can use it
+        global dialog
+        dialog = d
 
-with ui.row().style(
-    '''
-    padding:12px;
-    width:100%;
-    height:95vh;      
-    box-sizing:border-box;
-    gap:12px;
-    overflow:hidden;    
-    '''
-):
-    with ui.column().style(
+    dark = ui.dark_mode()
+    dark.enable()
+
+    with ui.row().style(
         '''
-        width:520px;
-        height:100%;
-        padding:20px;
-        border:1px solid #e5e7eb;
-        border-radius:8px;
-        box-shadow:0 1px 3px rgba(0,0,0,0.06);
-        overflow-y:auto; 
-        '''
-    ):  
-        ui.label('Projects').style('font-size: 36px; font-weight: 800; color: #4ecda4;')
-        ui.button('Add New Project', on_click=add_project)
-        projects_list()
-
-    with ui.column().style(
-        '''
-        flex:1;
-        height:100%;
-        padding:20px;
-        border:1px solid #e5e7eb;
-        border-radius:8px;
-        box-shadow:0 1px 3px rgba(0,0,0,0.06);
-        overflow-y:auto;
+        padding:12px;
+        width:100%;
+        height:95vh;
+        box-sizing:border-box;
+        gap:12px;
+        overflow:hidden;
         '''
     ):
-        project_details()
+        with ui.column().style(
+            '''
+            width:520px;
+            height:100%;
+            padding:20px;
+            border:1px solid #e5e7eb;
+            border-radius:8px;
+            box-shadow:0 1px 3px rgba(0,0,0,0.06);
+            overflow-y:auto;
+            '''
+        ):
+            ui.label('Projects').style('font-size: 36px; font-weight: 800; color: #4ecda4;')
+            ui.button('Add New Project', on_click=add_project)
+            projects_list()
 
+        with ui.column().style(
+            '''
+            flex:1;
+            height:100%;
+            padding:20px;
+            border:1px solid #e5e7eb;
+            border-radius:8px;
+            box-shadow:0 1px 3px rgba(0,0,0,0.06);
+            overflow-y:auto;
+            '''
+        ):
+            project_details()
+
+
+@ui.page('/qc')
+def qc_page():
+    dark = ui.dark_mode()
+    dark.enable()
+
+    ui.label('QC Runner').style('font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;')
+
+    if SELECTED_PROJECT:
+        ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style('color:#ddd;')
+        ui.label(SELECTED_PROJECT.get('project_description', '')).style('color:#bbb;')
+    else:
+        ui.label('No project selected. Go back and select one.').style('color:#fbbf24;')
+
+    ui.button('Back to Projects', on_click=lambda: ui.navigate.to('/')).props('flat')
+
+
+# -----------------------------
+# run
+# -----------------------------
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(host='127.0.0.1', port=8080, native=True)
