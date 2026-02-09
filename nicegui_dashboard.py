@@ -6,6 +6,8 @@ from pathlib import Path
 import json
 from datetime import datetime
 
+from qc_functions import read_10x_mtx, find_species, calculate_qc_metrics,voilin_plot, MT_TO_SPECIES, SPECIES_TO_MT  
+
 PROJECTS_DIR = Path('projects')
 SELECTED_PROJECT: dict | None = None
 
@@ -52,6 +54,83 @@ def existing_titles() -> set[str]:
         if md and md.get("project_title"):
             titles.add(str(md["project_title"]).strip())
     return titles
+
+#------------------------------
+# QC functions
+#------------------------------
+from pathlib import Path
+import json
+import numpy as np
+import plotly.graph_objects as go
+from nicegui import ui
+
+def load_violin_arrays(project_path: str | Path):
+    hc_path = Path(project_path) / "cellborg-cli" / "highcharts_data.json"
+    if not hc_path.exists():
+        raise FileNotFoundError(f"{hc_path} not found")
+
+    hc = json.loads(hc_path.read_text(encoding="utf-8"))
+
+    a1, a2, a3 = [], [], []
+
+    if isinstance(hc, dict):
+        vals = list(hc.values())
+
+        # Layout 2: {"CELLID": {"n_genes":..,"total_counts":..,"pct_counts_mt":..}, ...}
+        if vals and isinstance(vals[0], dict):
+            for v in vals:
+                if not isinstance(v, dict):
+                    continue
+                ng = v.get("n_genes")
+                tc = v.get("total_counts")
+                mt = v.get("pct_counts_mt")
+                if ng is not None:
+                    try: a1.append(float(ng))
+                    except Exception: pass
+                if tc is not None:
+                    try: a2.append(float(tc))
+                    except Exception: pass
+                if mt is not None:
+                    try: a3.append(float(mt))
+                    except Exception: pass
+
+        # Layout 1: {"n_genes_by_counts":[...], "total_counts":[...], "pct_counts_mt":[...]}
+        else:
+            # accept common key variants
+            k1 = "n_genes_by_counts" if "n_genes_by_counts" in hc else "n_genes"
+            k2 = "total_counts"
+            k3 = "pct_counts_mt"
+            for x in hc.get(k1, []) or []:
+                try: a1.append(float(x))
+                except Exception: pass
+            for x in hc.get(k2, []) or []:
+                try: a2.append(float(x))
+                except Exception: pass
+            for x in hc.get(k3, []) or []:
+                try: a3.append(float(x))
+                except Exception: pass
+
+    return a1, a2, a3
+
+
+def violin_figure(values, title: str, x_label: str = ""):
+    v = np.array(values, dtype=float)
+    v = v[np.isfinite(v)]
+    fig = go.Figure()
+    fig.add_trace(go.Violin(
+        y=v,
+        box_visible=True,
+        meanline_visible=True,
+        points="outliers",
+        name=title,
+    ))
+    fig.update_layout(
+        title=title,
+        height=320,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    fig.update_xaxes(title=x_label)
+    return fig
 
 
 # -----------------------------
@@ -134,9 +213,10 @@ def project_details():
     ui.label(f"Title: {SELECTED_PROJECT.get('project_title', '')}").style('color:#ddd; font-size: 18px;')
     ui.label(f"Description: {SELECTED_PROJECT.get('project_description', '')}").style('color:#bbb;')
 
-    with ui.row().classes('w-full').style('gap:12px; margin-top:12px;'):
-        ui.button('Run QC', on_click=lambda: ui.navigate.to('/qc')).style('flex:1;')
-        ui.button('Run Analysis').style('flex:1;')
+    if SELECTED_PROJECT:
+        with ui.row().classes('w-full').style('gap:12px; margin-top:12px;'):
+            ui.button('Run QC', on_click=lambda: ui.navigate.to('/qc')).style('flex:1;')
+            ui.button('Run Analysis').style('flex:1;')
 
 
 async def add_project() -> None:
@@ -147,6 +227,7 @@ async def add_project() -> None:
 
     try:
         dest = await copy_folder_to_projects(folder)
+        species = find_species(dest / "features.tsv.gz")
     except Exception as e:
         ui.notify(f'Failed to copy: {e}', color='negative')
         return
@@ -166,6 +247,7 @@ async def add_project() -> None:
             md = {
                 "original_folder_name": folder.name,
                 "project_path": str(dest),
+                "species": species,
                 "project_title": (title_input.value or dest.name).strip(),
                 "project_description": desc_input.value or "",
                 "added_at": datetime.now().isoformat(),
@@ -240,18 +322,65 @@ def dashboard_page():
 
 @ui.page('/qc')
 def qc_page():
+    SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
+    if not SELECTED_PROJECT_PATH:
+        ui.label('No project selected. Go back and select one.').style('color:#fbbf24;')
+        ui.button('Back to Projects', on_click=lambda: ui.navigate.to('/')).props('flat')
+        return
+
     dark = ui.dark_mode()
     dark.enable()
 
     ui.label('QC Runner').style('font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;')
+    ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style('color:#ddd;')
+    ui.label(SELECTED_PROJECT.get('project_description', '')).style('color:#bbb;')
 
-    if SELECTED_PROJECT:
-        ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style('color:#ddd;')
-        ui.label(SELECTED_PROJECT.get('project_description', '')).style('color:#bbb;')
-    else:
-        ui.label('No project selected. Go back and select one.').style('color:#fbbf24;')
+    ui.separator().style('opacity:0.25; margin: 12px 0;')
 
+    # ---- Run your QC pipeline (optional) ----
+    # If you do heavy compute here, strongly consider running it in a background task
+    # and showing a spinner; but for now keeping your structure.
+    try:
+        adata = read_10x_mtx(SELECTED_PROJECT_PATH)
+    except Exception as e:
+        ui.notify(f"Failed to read project data: {e}", color='negative')
+        ui.button('Back to Projects', on_click=lambda: ui.navigate.to('/')).props('flat')
+        return
+
+    mt = "MT-"
+    try:
+        species = SELECTED_PROJECT.get("species")
+        if species:
+            mt = SPECIES_TO_MT.get(species, mt)
+    except Exception:
+        pass
+
+    try:
+        calculate_qc_metrics(mt, adata)
+        voilin_plot(adata, SELECTED_PROJECT_PATH)  # (your function that writes highcharts_data.json)
+    except Exception as e:
+        ui.notify(f"QC metrics failed: {e}", color='negative')
+        return
+
+    # ---- Render graphs from highcharts_data.json ----
+    try:
+        a1, a2, a3 = load_violin_arrays(SELECTED_PROJECT_PATH)
+    except Exception as e:
+        ui.notify(f"Could not load violin plot data: {e}", color='negative')
+        return
+
+    # Layout: 3 charts in a responsive row
+    with ui.row().classes('w-full').style('gap:12px; flex-wrap: wrap;'):
+        with ui.card().style('flex: 1; min-width: 320px;'):
+            ui.plotly(violin_figure(a1, 'n_genes'))
+        with ui.card().style('flex: 1; min-width: 320px;'):
+            ui.plotly(violin_figure(a2, 'total_counts'))
+        with ui.card().style('flex: 1; min-width: 320px;'):
+            ui.plotly(violin_figure(a3, 'pct_counts_mt'))
+
+    ui.separator().style('opacity:0.25; margin: 12px 0;')
     ui.button('Back to Projects', on_click=lambda: ui.navigate.to('/')).props('flat')
+
 
 
 # -----------------------------
