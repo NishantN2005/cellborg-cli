@@ -294,8 +294,12 @@ def project_details():
     ui.label(f"Description: {SELECTED_PROJECT.get('project_description', '')}").style("color:#bbb;")
 
     if SELECTED_PROJECT:
+        status = SELECTED_PROJECT.get("status", "unknown").upper()
         with ui.row().classes("w-full").style("gap:12px; margin-top:12px;"):
-            ui.button("Run QC", on_click=lambda: ui.navigate.to("/qc")).style("flex:1;")
+            if status == "QC":
+                ui.button("Run QC", on_click=lambda: ui.navigate.to("/qc")).style("flex:1;")
+            elif status == "PROC_ANNO":
+                ui.button("Run PA", on_click=lambda: ui.notify("Not implemented yet")).style("flex:1;")
             ui.button("Run Analysis").style("flex:1;")
 
 
@@ -326,11 +330,12 @@ async def add_project() -> None:
         def save():
             md = {
                 "original_folder_name": folder.name,
-                "project_path": str(dest),
+                "projzect_path": str(dest),
                 "species": species,
                 "project_title": (title_input.value or dest.name).strip(),
                 "project_description": desc_input.value or "",
                 "added_at": datetime.now().isoformat(),
+                "status": "qc"
             }
             (dest / "cellborg-cli").mkdir(parents=True, exist_ok=True)
             (dest / "cellborg-cli" / "metadata.json").write_text(json.dumps(md, indent=4), encoding="utf-8")
@@ -606,6 +611,16 @@ def qc_page():
             save_btn.disable()
             with actions:
                 ui.notify("Saving QC…", color="info")
+
+            #change status in metadata.json file to qc complete
+            md_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "metadata.json"
+            if md_path.exists():
+                try:
+                    md = json.loads(md_path.read_text(encoding="utf-8"))
+                    md["status"] = "proc_anno"
+                    md_path.write_text(json.dumps(md, indent=4), encoding="utf-8")
+                except Exception as e:
+                    print(f"Failed to update metadata.json: {e}")
 
             asyncio.create_task(
                 save_qc_async(
