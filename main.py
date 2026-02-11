@@ -19,6 +19,11 @@ from qc_functions import (
     SPECIES_TO_MT,
 )
 
+from pa_functions import (
+    read_adata,
+    init_project
+)
+
 PROJECTS_DIR = Path("projects")
 SELECTED_PROJECT: dict | None = None
 
@@ -646,6 +651,15 @@ def pa_page():
     dark = ui.dark_mode()
     dark.enable()
 
+    #read adata_qc.h5ad file created in qc step, if not found show error message
+    adata_qc_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_qc.h5ad"
+    if not adata_qc_path.exists():
+        ui.label("QC dataset not found. Please run QC first.").style("color:#fbbf24;")
+        ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
+        return
+    adata = read_adata(adata_qc_path)
+    init_project(SELECTED_PROJECT_PATH, adata)
+    print(adata)
     ui.label("Processing and Annotation").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
     ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
     ui.label(SELECTED_PROJECT.get("project_description", "")).style("color:#bbb;")

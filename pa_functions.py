@@ -1,5 +1,17 @@
 import scanpy as sc
 import json
+
+principle_components=50
+
+def read_adata(adata_path):
+    print("------ read_adata begins -------")
+    try:
+        adata = sc.read_h5ad(adata_path)
+        print(f"Successfully read adata from {adata_path}")
+        return adata
+    except Exception as e:
+        raise RuntimeError(f"Failed to read adata file '{adata_path}': {e}")
+    
 def normalize(adata):
     print("-----normalize begins----")
     # Normalizing to median total counts
@@ -16,7 +28,8 @@ def feature_selection(adata):
     sc.pp.highly_variable_genes(adata, n_top_genes=2000)
     sc.pl.highly_variable_genes(adata)
 
-def dimentionality_reduction(selected_project_path, adata, principal_components=50):
+def dimentionality_reduction(adata):
+    global principle_components
     # ## Dimensionality Reduction
     # Reduce the dimensionality of the data by running principal component analysis (PCA), which reveals the main axes of variation and denoises the data.
     print("------- dimentionality reduction begins ------")
@@ -58,22 +71,22 @@ def dimentionality_reduction(selected_project_path, adata, principal_components=
     )
 
 
-def init_project(selected_project_path, adata, principal_components=50, ):
-    sc.settings.figdir = f"{selected_project_path}/cellborg/figures"
+def init_project(selected_project_path, adata):
+    sc.settings.figdir = f"{selected_project_path}/cellborg-cli/figures"
 
     #TODO: concat datasets
     print("TODO: Concate datasets")
-    normalize()
+    normalize(adata)
     print('Successfully normalized concatonated dataset')
-    feature_selection()
+    feature_selection(adata)
     print('Successfully selected features')
-    dimentionality_reduction(selected_project_path)
+    dimentionality_reduction(adata)
     print('Successfully reduced dimentionality')
 
     numpcs = {
-            "num_pcs":principal_components,
+            "num_pcs":principle_components,
             "gene_list": adata.var_names.to_list()
     }
-    with open(f"{selected_project_path}/cellborg/project_values.json", "w") as outputfile:
+    with open(f"{selected_project_path}/cellborg-cli/project_values.json", "w") as outputfile:
             json.dump(numpcs, outputfile)
     print("created project_values.json file")
