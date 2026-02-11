@@ -299,7 +299,7 @@ def project_details():
             if status == "QC":
                 ui.button("Run QC", on_click=lambda: ui.navigate.to("/qc")).style("flex:1;")
             elif status == "PROC_ANNO":
-                ui.button("Run PA", on_click=lambda: ui.notify("Not implemented yet")).style("flex:1;")
+                ui.button("Run PA", on_click=lambda: ui.navigate.to("/pa")).style("flex:1;")
             ui.button("Run Analysis").style("flex:1;")
 
 
@@ -634,7 +634,21 @@ def qc_page():
 
         save_btn.on("click", lambda e: on_save_click())
 
+@ui.page("/pa")
+def pa_page():
+    SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
 
+    if not SELECTED_PROJECT_PATH:
+        ui.label("No project selected. Go back and select one.").style("color:#fbbf24;")
+        ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
+        return
+
+    dark = ui.dark_mode()
+    dark.enable()
+
+    ui.label("Processing and Annotation").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
+    ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
+    ui.label(SELECTED_PROJECT.get("project_description", "")).style("color:#bbb;")
 # -----------------------------
 # run
 # -----------------------------
