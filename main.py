@@ -1,3 +1,4 @@
+# dropin_cellborg_ui.py
 from nicegui import ui, app
 import os
 import shutil
@@ -5,7 +6,9 @@ import asyncio
 from pathlib import Path
 import json
 from datetime import datetime
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 
 from qc_functions import (
@@ -21,7 +24,8 @@ from qc_functions import (
 
 from pa_functions import (
     read_adata,
-    init_project
+    init_project,
+    do_clustering,
 )
 
 PROJECTS_DIR = Path("projects")
@@ -171,8 +175,8 @@ def _as_float(x, default=0.0) -> float:
 
 def thresholds_elements_to_values(qc_thresholds: dict) -> dict:
     """
-    Converts your QC_THRESHOLDS (which currently stores ui.number elements)
-    into plain floats so background threads + gate_adata don't see UI objects.
+    Converts QC_THRESHOLDS (ui.number elements) into plain floats
+    so background threads + gate_adata don't see UI objects.
     """
     out: dict = {}
     for metric, bundle in (qc_thresholds or {}).items():
@@ -216,6 +220,72 @@ async def save_qc_async(*, adata, qc_thresholds_elements: dict, project_path: st
                 save_button.enable()
             except Exception:
                 pass
+
+
+# ------------------------------
+# PA: load UMAP JSON + plot (cluster colors)
+# ------------------------------
+def load_umap_dict(project_path: str | Path, resolution: float) -> dict:
+    umap_path = (
+        Path(project_path)
+        / "cellborg-cli"
+        / "figures"
+        / "umap"
+        / f"umap_clustering_res_{int(resolution * 100)}.json"
+    )
+    if not umap_path.exists():
+        raise FileNotFoundError(f"UMAP json not found: {umap_path}")
+    return json.loads(umap_path.read_text(encoding="utf-8"))
+
+
+def umap_scatter_figure_from_dict(umap_dict: dict, title="UMAP (Leiden clusters)"):
+    """
+    umap_dict format:
+    {
+        "CELLID": {"UMAP1": float, "UMAP2": float, "cluster": "0"},
+        ...
+    }
+    One trace per cluster => Plotly assigns different colors automatically.
+    """
+    df = pd.DataFrame.from_dict(umap_dict, orient="index")
+
+    df["UMAP1"] = pd.to_numeric(df.get("UMAP1"), errors="coerce")
+    df["UMAP2"] = pd.to_numeric(df.get("UMAP2"), errors="coerce")
+    df["cluster"] = df.get("cluster").astype(str)
+
+    df = df.dropna(subset=["UMAP1", "UMAP2"])
+
+    def _cluster_key(x: str):
+        try:
+            return (0, int(x))
+        except Exception:
+            return (1, x)
+
+    clusters = sorted(df["cluster"].unique(), key=_cluster_key)
+
+    fig = go.Figure()
+    for c in clusters:
+        sub = df[df["cluster"] == c]
+        fig.add_trace(
+            go.Scattergl(
+                x=sub["UMAP1"],
+                y=sub["UMAP2"],
+                mode="markers",
+                name=f"Cluster {c}",
+                marker=dict(size=3),
+                hoverinfo="skip",
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        height=700,
+        margin=dict(l=20, r=20, t=50, b=20),
+        legend=dict(itemsizing="constant"),
+    )
+    fig.update_xaxes(title="UMAP1")
+    fig.update_yaxes(title="UMAP2")
+    return fig
 
 
 # -----------------------------
@@ -298,14 +368,13 @@ def project_details():
     ui.label(f"Title: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd; font-size: 18px;")
     ui.label(f"Description: {SELECTED_PROJECT.get('project_description', '')}").style("color:#bbb;")
 
-    if SELECTED_PROJECT:
-        status = SELECTED_PROJECT.get("status", "unknown").upper()
-        with ui.row().classes("w-full").style("gap:12px; margin-top:12px;"):
-            if status == "QC":
-                ui.button("Run QC", on_click=lambda: ui.navigate.to("/qc")).style("flex:1;")
-            elif status == "PROC_ANNO":
-                ui.button("Run PA", on_click=lambda: ui.navigate.to("/pa")).style("flex:1;")
-            ui.button("Run Analysis").style("flex:1;")
+    status = str(SELECTED_PROJECT.get("status", "unknown")).upper()
+    with ui.row().classes("w-full").style("gap:12px; margin-top:12px;"):
+        if status == "QC":
+            ui.button("Run QC", on_click=lambda: ui.navigate.to("/qc")).style("flex:1;")
+        elif status in ("PROC_ANNO", "PA"):
+            ui.button("Run PA", on_click=lambda: ui.navigate.to("/pa")).style("flex:1;")
+        ui.button("Run Analysis").style("flex:1;")
 
 
 async def add_project() -> None:
@@ -325,22 +394,23 @@ async def add_project() -> None:
 
     with dialog, ui.card().classes("w-96"):
         ui.label("Project Title")
-        title_input = ui.input(validation=lambda v: "Title already exists" if v and v.strip() in existing_titles() else None).props(
-            "autofocus"
-        )
+        title_input = ui.input(
+            validation=lambda v: "Title already exists" if v and v.strip() in existing_titles() else None
+        ).props("autofocus")
 
         ui.label("Project description")
         desc_input = ui.textarea().style("height: 100px; width: 100%;")
 
         def save():
+            # NOTE: fixed key "project_path" (your old code used "projzect_path")
             md = {
                 "original_folder_name": folder.name,
-                "projzect_path": str(dest),
+                "project_path": str(dest),
                 "species": species,
                 "project_title": (title_input.value or dest.name).strip(),
                 "project_description": desc_input.value or "",
                 "added_at": datetime.now().isoformat(),
-                "status": "qc"
+                "status": "QC",
             }
             (dest / "cellborg-cli").mkdir(parents=True, exist_ok=True)
             (dest / "cellborg-cli" / "metadata.json").write_text(json.dumps(md, indent=4), encoding="utf-8")
@@ -486,11 +556,8 @@ def qc_page():
             height=520,
             margin=dict(l=25, r=25, t=55, b=20),
             xaxis=dict(showticklabels=False),
-
-            # (left exactly as you had it)
             dragmode="pan",
             newshape=dict(line=dict(width=2)),
-
             shapes=[
                 dict(
                     type="line",
@@ -521,9 +588,6 @@ def qc_page():
     def set_line(fig, idx: int, y: float):
         fig.layout.shapes[idx].y0 = y
         fig.layout.shapes[idx].y1 = y
-
-    def get_line(fig, idx: int) -> float:
-        return float(fig.layout.shapes[idx].y0)
 
     def qc_tile(metric: str, values: list[float]):
         data_min, data_max = finite_min_max(values)
@@ -557,9 +621,7 @@ def qc_page():
                 set_line(plot.figure, 1, y_max)
 
                 plot.figure.update_yaxes(range=[y_min, y_max])
-
                 plot.update()
-                print(f"[{metric}] min={y_min} max={y_max}")
 
             min_in.on("change", lambda e: apply_from_inputs())
             max_in.on("change", lambda e: apply_from_inputs())
@@ -605,39 +667,39 @@ def qc_page():
 
     ui.separator().style("opacity:0.25; margin: 12px 0;")
 
-    # IMPORTANT: define 'actions' container (you were using it but never created it)
     actions = ui.row().classes("w-full").style("gap:12px;")
     with actions:
         ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat").style("flex:1")
-
         save_btn = ui.button("Save").props("flat").style("flex:1")
 
         def on_save_click():
             save_btn.disable()
-            with actions:
-                ui.notify("Saving QC…", color="info")
+            ui.notify("Saving QC…", color="info")
 
-            #change status in metadata.json file to qc complete
+            # update metadata status
             md_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "metadata.json"
             if md_path.exists():
                 try:
                     md = json.loads(md_path.read_text(encoding="utf-8"))
-                    md["status"] = "proc_anno"
+                    md["status"] = "PROC_ANNO"
                     md_path.write_text(json.dumps(md, indent=4), encoding="utf-8")
+                    # update selected project in memory too
+                    SELECTED_PROJECT.update(md)
                 except Exception as e:
                     print(f"Failed to update metadata.json: {e}")
 
             asyncio.create_task(
                 save_qc_async(
                     adata=adata,
-                    qc_thresholds_elements=QC_THRESHOLDS,  # <- UI elements dict (we convert to floats inside)
-                    project_path=SELECTED_PROJECT["project_path"],
-                    ui_slot=actions,  # <- explicit UI slot
+                    qc_thresholds_elements=QC_THRESHOLDS,
+                    project_path=SELECTED_PROJECT_PATH,
+                    ui_slot=actions,
                     save_button=save_btn,
                 )
             )
 
         save_btn.on("click", lambda e: on_save_click())
+
 
 @ui.page("/pa")
 def pa_page():
@@ -651,18 +713,66 @@ def pa_page():
     dark = ui.dark_mode()
     dark.enable()
 
-    #read adata_qc.h5ad file created in qc step, if not found show error message
+    ui.label("Processing and Annotation").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
+    ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
+    ui.label(SELECTED_PROJECT.get("project_description", "")).style("color:#bbb;")
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
     adata_qc_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_qc.h5ad"
     if not adata_qc_path.exists():
         ui.label("QC dataset not found. Please run QC first.").style("color:#fbbf24;")
         ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
         return
+
+    # Load + init once per page load
     adata = read_adata(adata_qc_path)
     init_project(SELECTED_PROJECT_PATH, adata)
-    print(adata)
-    ui.label("Processing and Annotation").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
-    ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
-    ui.label(SELECTED_PROJECT.get("project_description", "")).style("color:#bbb;")
+
+    # Controls: resolution slider + run button
+    with ui.row().classes("w-full items-center").style("gap:16px;"):
+        ui.label("Leiden resolution").style("color:#ddd; min-width:160px;")
+
+        res_slider = ui.slider(min=0.1, max=2.0, value=0.8, step=0.05).props("label-always").style("flex:1;")
+        res_label = ui.label("0.80").style("color:#ddd; width:70px; text-align:right;")
+        run_btn = ui.button("Run clustering").style("min-width:170px;")
+
+    def sync_res_label():
+        res_label.text = f"{float(res_slider.value):.2f}"
+
+    res_slider.on("change", lambda e: sync_res_label())
+    sync_res_label()
+
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
+    with ui.card().classes("w-full").style("padding:16px;"):
+        status_lbl = ui.label("Adjust resolution and click “Run clustering” to render UMAP.").style("color:#bbb;")
+        umap_plot = ui.plotly(go.Figure()).style("width:100%;")
+
+    async def run_and_render():
+        run_btn.disable()
+        res = float(res_slider.value)
+        status_lbl.text = f"Clustering at resolution {res:.2f}…"
+        try:
+            if f"umap_clustering_res_{int(res*100)}.json" not in os.listdir(Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "figures" / "umap"):
+                # heavy work off UI thread
+                await asyncio.to_thread(do_clustering, adata, res)
+
+            # load UMAP json + plot (each cluster different color via per-trace split)
+            umap_dict = load_umap_dict(SELECTED_PROJECT_PATH, res)
+            fig = umap_scatter_figure_from_dict(umap_dict, title=f"UMAP (Leiden res={res:.2f})")
+
+            umap_plot.figure = fig
+            umap_plot.update()
+            status_lbl.text = f"Rendered UMAP for resolution {res:.2f}"
+        except Exception as e:
+            status_lbl.text = f"Failed: {e}"
+            ui.notify(f"PA failed: {e}", color="negative")
+        finally:
+            run_btn.enable()
+
+    run_btn.on("click", lambda e: asyncio.create_task(run_and_render()))
+
+
 # -----------------------------
 # run
 # -----------------------------
