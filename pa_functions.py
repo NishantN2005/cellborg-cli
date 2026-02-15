@@ -144,10 +144,11 @@ def do_clustering(adata, resolution):
     try:
         clusters = clustering(project_path, adata, resolution)
 
+        print("in do clustering", project_path)
         #add clustering resolution
         with open(f"{project_path}/cellborg-cli/project_values.json", "r+") as f:
             data = json.load(f)
-            data['clust_resolution'] = resolution
+            data['clust_resolution'] = float(resolution)
             #write over file
             f.seek(0)
             json.dump(data, f)

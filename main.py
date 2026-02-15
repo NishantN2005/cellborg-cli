@@ -373,7 +373,7 @@ def project_details():
         if status == "QC":
             ui.button("Run QC", on_click=lambda: ui.navigate.to("/qc")).style("flex:1;")
         elif status in ("PROC_ANNO", "PA"):
-            ui.button("Run PA", on_click=lambda: ui.navigate.to("/pa")).style("flex:1;")
+            ui.button("Run PA", on_click=lambda: ui.navigate.to("/pca")).style("flex:1;")
         ui.button("Run Analysis").style("flex:1;")
 
 
@@ -701,8 +701,9 @@ def qc_page():
         save_btn.on("click", lambda e: on_save_click())
 
 
-@ui.page("/pa")
-def pa_page():
+@ui.page("/pca")
+def pca_page():
+    PCA_DONE = False  # global flag to track if PCA has been done (enables "Next" button)
     SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
 
     if not SELECTED_PROJECT_PATH:
@@ -714,8 +715,8 @@ def pa_page():
     dark.enable()
 
     ui.label("Processing and Annotation").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
-    ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
-    ui.label(SELECTED_PROJECT.get("project_description", "")).style("color:#bbb;")
+    #ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
+    #ui.label(SELECTED_PROJECT.get("project_description", "")).style("color:#bbb;")
     ui.separator().style("opacity:0.25; margin: 12px 0;")
 
     adata_qc_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_qc.h5ad"
@@ -749,13 +750,13 @@ def pa_page():
         umap_plot = ui.plotly(go.Figure()).style("width:100%;")
 
     async def run_and_render():
+        nonlocal PCA_DONE
+        PCA_DONE = False
         run_btn.disable()
         res = float(res_slider.value)
         status_lbl.text = f"Clustering at resolution {res:.2f}…"
         try:
-            if f"umap_clustering_res_{int(res*100)}.json" not in os.listdir(Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "figures" / "umap"):
-                # heavy work off UI thread
-                await asyncio.to_thread(do_clustering, adata, res)
+            await asyncio.to_thread(do_clustering, adata, res)
 
             # load UMAP json + plot (each cluster different color via per-trace split)
             umap_dict = load_umap_dict(SELECTED_PROJECT_PATH, res)
@@ -764,14 +765,280 @@ def pa_page():
             umap_plot.figure = fig
             umap_plot.update()
             status_lbl.text = f"Rendered UMAP for resolution {res:.2f}"
+            PCA_DONE = True
         except Exception as e:
             status_lbl.text = f"Failed: {e}"
             ui.notify(f"PA failed: {e}", color="negative")
-        finally:
-            run_btn.enable()
+        finally:             
+            next_btn.enable()
+            run_btn.enable() 
 
     run_btn.on("click", lambda e: asyncio.create_task(run_and_render()))
 
+    next_btn = ui.button(
+        'Next →',
+        on_click=lambda: ui.navigate.to("/anno"),
+    ).props('unelevated')
+    next_btn.disable()  # default locked
+
+    # enable if PCA already completed
+    if PCA_DONE:
+        print("PCA already done, enabling Next button")
+        next_btn.enable()
+
+    with ui.row().classes('w-full justify-end mt-6'):
+        next_btn
+
+
+@ui.page("/anno")
+def annotation_page():
+    ui.dark_mode().enable()
+
+    # ---- locate project + gene list ----
+    SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
+    if not SELECTED_PROJECT_PATH:
+        ui.label("No project selected. Go back and select one.").style("color:#fbbf24;")
+        ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
+        return
+
+    pv_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "project_values.json"
+    if not pv_path.exists():
+        ui.label("project_values.json not found. Run PA first.").style("color:#fbbf24;")
+        ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
+        return
+
+    try:
+        pv = json.loads(pv_path.read_text(encoding="utf-8"))
+        gene_list = pv.get("gene_list", [])
+        if not isinstance(gene_list, list):
+            gene_list = []
+        gene_list = [str(g) for g in gene_list]
+    except Exception as e:
+        ui.label(f"Failed to read project_values.json: {e}").style("color:#fbbf24;")
+        return
+
+    genes_upper = [(g, g.upper()) for g in gene_list]
+
+    ui.label("Annotations").style(
+        "font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;"
+    )
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
+    with ui.row().classes("w-full").style("gap:18px; padding:12px; height: calc(100vh - 120px);"):
+        # LEFT COLUMN
+        with ui.column().style("width:520px; gap:10px; position:relative;"):
+            ui.label("Gene search").style("color:#e5e7eb; font-weight:700;")
+
+            chips_row = ui.row().classes("items-center w-full").style(
+                "gap:10px; padding:10px; border:1px solid #374151; border-radius:8px; background:#0b1220;"
+            )
+
+            selected_genes: list[str] = []
+
+            def render_chips():
+                chips_row.clear()
+                with chips_row:
+                    if not selected_genes:
+                        ui.label("Selected genes will appear here.").style("color:#9ca3af;")
+                        return
+                    for g in selected_genes:
+                        with ui.row().classes("items-center").style(
+                            "gap:8px; padding:7px 10px; border:1px solid #4b5563; border-radius:8px; background:#111827;"
+                        ):
+                            ui.label(g).style("color:#e5e7eb; font-size:16px;")
+                            ui.button(
+                                icon="close",
+                                on_click=lambda gg=g: (selected_genes.remove(gg), render_chips()),
+                            ).props("flat dense").style("color:#ef4444;")
+
+            search_wrap = ui.column().classes("w-full").style("position:relative;")
+            with search_wrap:
+                search_in = (
+                    ui.input(placeholder="Search gene (e.g., Dnpep, Rnpepl1, Sept2)")
+                    .props("outlined clearable")
+                    .style("width:100%;")
+                )
+
+                dropdown = ui.card().classes("w-full").style(
+                    """
+                    position:absolute;
+                    top:52px;
+                    left:0;
+                    right:0;
+                    z-index:9999;
+                    padding:6px;
+                    border:1px solid #374151;
+                    border-radius:10px;
+                    background:#0b1220;
+                    box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+                    max-height: 260px;
+                    overflow-y: auto;
+                    display:none;
+                    """
+                )
+
+            def hide_dropdown():
+                dropdown.style("display:none;")
+
+            def show_dropdown():
+                dropdown.style("display:block;")
+
+            def add_gene(g: str):
+                if g not in selected_genes:
+                    selected_genes.append(g)
+                    render_chips()
+                search_in.value = ""
+                hide_dropdown()
+                ui.notify(f"Selected {g}", color="positive")
+
+            def render_dropdown(matches: list[str], query: str):
+                dropdown.clear()
+                q = (query or "").strip()
+                if not q:
+                    hide_dropdown()
+                    return
+
+                if not matches:
+                    with dropdown:
+                        ui.label(f'No matches for "{q}".').style("color:#9ca3af; padding:6px;")
+                    show_dropdown()
+                    return
+
+                with dropdown:
+                    for g in matches[:20]:
+                        ui.button(
+                            g,
+                            on_click=lambda gg=g: add_gene(gg),
+                        ).props("flat dense").style(
+                            "width:100%; justify-content:flex-start; color:#e5e7eb; text-transform:none;"
+                        )
+                show_dropdown()
+
+            def do_search(query: str):
+                q = (query or "").strip()
+                if not q:
+                    render_dropdown([], "")
+                    return
+                q_up = q.upper()
+                matches = [g for (g, gu) in genes_upper if q_up in gu]
+                render_dropdown(matches, q)
+
+            search_in.on("input", lambda e: do_search(search_in.value))
+            search_in.on("change", lambda e: do_search(search_in.value))
+
+            ui.separator().style("opacity:0.25; margin: 10px 0;")
+            ui.label("Plot type").style("color:#e5e7eb; font-weight:700;")
+
+            plot_type = ui.radio(
+                options=["Feature Plot", "Violin Plot", "Dot Plot"],
+                value="Feature Plot",
+            ).props("inline").style("color:#e5e7eb;")
+
+            load_btn = ui.button("Load Plot").style(
+                "width:100%; height:46px; background:#41c99a; color:#0b1220; font-weight:800; border-radius:8px;"
+            )
+
+            render_chips()
+            hide_dropdown()
+
+        # RIGHT COLUMN
+        with ui.column().style("flex:1; gap:12px;"):
+            ui.label("Single-cell RNAseq Gene Expression").style(
+                "font-size: 20px; font-weight: 800; color:#e5e7eb; text-align:center; margin-top:6px;"
+            )
+
+            plot_card = ui.card().classes("w-full").style(
+                "flex:1; padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+            )
+            with plot_card:
+                plot_status = ui.label("Choose a plot type and click Load Plot.").style("color:#9ca3af;")
+                plot_el = ui.plotly(go.Figure()).style("width:100%; height:100%;")
+
+            # ---- buttons under chart ----
+            with ui.row().classes("w-full").style("gap:12px;"):
+                cluster_btn = ui.button("Cluster Plot").style(
+                    "flex:1; height:48px; border-radius:8px; background:#41c99a; color:#0b1220; font-weight:800;"
+                )
+
+                plot_name_btn = ui.button(
+                    plot_type.value,
+                    on_click=lambda: (
+                        print(f"{plot_type.value} clicked"),
+                        ui.notify(f"{plot_type.value} clicked", color="info"),
+                    ),
+                ).style(
+                    "flex:1; height:48px; border-radius:8px; background:#41c99a; color:#0b1220; font-weight:800;"
+                )
+
+            async def load_cluster_plot():
+                # IMPORTANT: always enter a slot when updating UI from async handlers
+                with plot_card:
+                    cluster_btn.disable()
+                    try:
+                        print('------------ Loading cluster plot ---', pv.get("clust_resolution"))
+                        res_raw = pv.get("clust_resolution", None)
+                        if res_raw is None:
+                            plot_status.text = 'Missing "clust_resolution" in project_values.json'
+                            ui.notify('Missing "clust_resolution" in project_values.json', color="negative")
+                            return
+
+                        try:
+                            res = float(res_raw)
+                        except Exception:
+                            plot_status.text = f'Invalid clust_resolution: {res_raw!r}'
+                            ui.notify(f'Invalid "clust_resolution": {res_raw!r}', color="negative")
+                            return
+
+                        plot_status.text = f"Loading cluster UMAP (res={res:.2f})…"
+
+                        umap_dict = load_umap_dict(SELECTED_PROJECT_PATH, res)
+                        fig = umap_scatter_figure_from_dict(umap_dict, title=f"UMAP (Leiden res={res:.2f})")
+
+                        plot_el.figure = fig
+                        plot_el.update()
+
+                        plot_status.text = f"Loaded cluster UMAP (res={res:.2f})"
+                        ui.notify("Loaded cluster plot", color="positive")
+
+                    except Exception as e:
+                        plot_status.text = f"Failed to load cluster plot: {e}"
+                        ui.notify(f"Cluster plot failed: {e}", color="negative")
+                    finally:
+                        cluster_btn.enable()
+
+            # DON’T use asyncio.create_task here; keep NiceGUI context intact
+            cluster_btn.on("click", lambda e: load_cluster_plot())
+
+            def load_plot_shim():
+                pt = plot_type.value
+                genes = ", ".join(selected_genes[:5]) if selected_genes else "(no genes selected)"
+                plot_status.text = f"Loaded: {pt} | Genes: {genes}"
+                ui.notify(f"Shim: loading {pt}", color="info")
+
+                fig = go.Figure()
+                if pt == "Feature Plot":
+                    fig.update_layout(title="Feature Plot (shim)", height=650)
+                elif pt == "Violin Plot":
+                    fig.add_trace(go.Violin(y=[1, 2, 3, 2, 4, 6, 2], box_visible=True, meanline_visible=True))
+                    fig.update_layout(title="Violin Plot (shim)", height=650)
+                else:
+                    fig.add_trace(go.Scatter(x=[1, 2, 3], y=[3, 1, 2], mode="markers"))
+                    fig.update_layout(title="Dot Plot (shim)", height=650)
+
+                plot_el.figure = fig
+                plot_el.update()
+
+                # keep the right-side button label in sync with selected plot
+                plot_name_btn.text = pt
+
+            # keep the label button synced even before loading (when user changes radio)
+            def on_plot_type_change():
+                plot_name_btn.text = plot_type.value
+
+            plot_type.on("change", lambda e: on_plot_type_change())
+            on_plot_type_change()
+
+            load_btn.on("click", lambda e: load_plot_shim())
 
 # -----------------------------
 # run
