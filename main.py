@@ -26,6 +26,7 @@ from pa_functions import (
     read_adata,
     init_project,
     do_clustering,
+    gene_expression
 )
 
 PROJECTS_DIR = Path("projects")
@@ -819,6 +820,14 @@ def annotation_page():
 
     genes_upper = [(g, g.upper()) for g in gene_list]
 
+    #------ premptively load adata -------
+    adata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_clustered.h5ad"
+    if not adata_path.exists():
+        ui.label("Clustered dataset not found. Please run PA first.").style("color:#fbbf24;")
+        ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
+        return 
+    adata = read_adata(adata_path)
+    
     ui.label("Annotations").style(
         "font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;"
     )
@@ -1009,27 +1018,268 @@ def annotation_page():
             # DON’T use asyncio.create_task here; keep NiceGUI context intact
             cluster_btn.on("click", lambda e: load_cluster_plot())
 
-            def load_plot_shim():
-                pt = plot_type.value
-                genes = ", ".join(selected_genes[:5]) if selected_genes else "(no genes selected)"
-                plot_status.text = f"Loaded: {pt} | Genes: {genes}"
-                ui.notify(f"Shim: loading {pt}", color="info")
+            def _cluster_sort_key(x: str):
+                try:
+                    return (0, int(x))
+                except Exception:
+                    return (1, str(x))
+
+            def load_gene_expression_df(project_path: str | Path) -> pd.DataFrame:
+                p = Path(project_path) / "cellborg-cli" / "figures" / "gene_expression_per_cell_with_clusters.json"
+                if not p.exists():
+                    raise FileNotFoundError(f"Gene expression json not found: {p}")
+                data = json.loads(p.read_text(encoding="utf-8"))
+                df = pd.DataFrame.from_dict(data, orient="index")
+                # normalize types
+                df["UMAP1"] = pd.to_numeric(df.get("UMAP1"), errors="coerce")
+                df["UMAP2"] = pd.to_numeric(df.get("UMAP2"), errors="coerce")
+                df["cluster"] = df.get("cluster").astype(str)
+                df = df.dropna(subset=["UMAP1", "UMAP2", "cluster"])
+                return df
+
+            def feature_plot_multi_gene(df: pd.DataFrame, genes: list[str]) -> go.Figure:
+                genes = [g for g in genes if g in df.columns]
+                if not genes:
+                    raise KeyError("None of the selected genes exist in the gene-expression JSON.")
+
+                # numeric + fill
+                for g in genes:
+                    df[g] = pd.to_numeric(df[g], errors="coerce").fillna(0.0)
+
+                clusters = sorted(df["cluster"].unique(), key=_cluster_sort_key)
 
                 fig = go.Figure()
-                if pt == "Feature Plot":
-                    fig.update_layout(title="Feature Plot (shim)", height=650)
-                elif pt == "Violin Plot":
-                    fig.add_trace(go.Violin(y=[1, 2, 3, 2, 4, 6, 2], box_visible=True, meanline_visible=True))
-                    fig.update_layout(title="Violin Plot (shim)", height=650)
-                else:
-                    fig.add_trace(go.Scatter(x=[1, 2, 3], y=[3, 1, 2], mode="markers"))
-                    fig.update_layout(title="Dot Plot (shim)", height=650)
 
-                plot_el.figure = fig
-                plot_el.update()
+                # trace bookkeeping: for each gene, we add:
+                # - one Scattergl per cluster
+                # - one hidden "colorbar" trace
+                traces_per_gene = len(clusters) + 1
 
-                # keep the right-side button label in sync with selected plot
+                for gi, gene in enumerate(genes):
+                    # cluster traces
+                    for c in clusters:
+                        sub = df[df["cluster"] == c]
+                        fig.add_trace(go.Scattergl(
+                            x=sub["UMAP1"],
+                            y=sub["UMAP2"],
+                            mode="markers",
+                            name=f"Cluster {c}",
+                            marker=dict(
+                                size=3,
+                                color=sub[gene],
+                                colorscale="Viridis",
+                                showscale=False,   # only show on the gene colorbar trace
+                            ),
+                            hovertemplate=f"cluster={c}<br>{gene}=%{{marker.color:.3f}}<extra></extra>",
+                            visible=(gi == 0),
+                        ))
+
+                    # shared colorbar trace for this gene
+                    gmin = float(df[gene].min())
+                    gmax = float(df[gene].max())
+                    fig.add_trace(go.Scattergl(
+                        x=[None], y=[None],
+                        mode="markers",
+                        marker=dict(
+                            color=[gmin, gmax],
+                            colorscale="Viridis",
+                            showscale=True,
+                            colorbar=dict(title=f"{gene} expr"),
+                        ),
+                        hoverinfo="skip",
+                        showlegend=False,
+                        visible=(gi == 0),
+                    ))
+
+                # dropdown: toggle visibility gene-by-gene
+                buttons = []
+                for gi, gene in enumerate(genes):
+                    vis = [False] * (traces_per_gene * len(genes))
+                    start = gi * traces_per_gene
+                    for k in range(traces_per_gene):
+                        vis[start + k] = True
+
+                    buttons.append(dict(
+                        label=gene,
+                        method="update",
+                        args=[
+                            {"visible": vis},
+                            {"title": f"Feature Plot: {gene} (per cluster)"}
+                        ],
+                    ))
+
+                fig.update_layout(
+                    title=f"Feature Plot: {genes[0]} (per cluster)",
+                    height=650,
+                    margin=dict(l=20, r=20, t=70, b=20),
+                    legend=dict(itemsizing="constant"),
+                    updatemenus=[dict(
+                        type="dropdown",
+                        x=0.01,
+                        y=1.15,
+                        xanchor="left",
+                        yanchor="top",
+                        buttons=buttons,
+                    )],
+                )
+                fig.update_xaxes(title="UMAP1")
+                fig.update_yaxes(title="UMAP2")
+                return fig
+
+            def violin_plot_multi_gene(df: pd.DataFrame, genes: list[str]) -> go.Figure:
+                genes = [g for g in genes if g in df.columns]
+                if not genes:
+                    raise KeyError("None of the selected genes exist in the gene-expression JSON.")
+
+                for g in genes:
+                    df[g] = pd.to_numeric(df[g], errors="coerce").fillna(0.0)
+
+                clusters = sorted(df["cluster"].unique(), key=_cluster_sort_key)
+
+                fig = go.Figure()
+
+                traces_per_gene = len(clusters)
+
+                for gi, gene in enumerate(genes):
+                    for c in clusters:
+                        sub = df[df["cluster"] == c]
+                        fig.add_trace(go.Violin(
+                            y=sub[gene],
+                            name=f"{c}",
+                            box_visible=True,
+                            meanline_visible=True,
+                            points=False,
+                            visible=(gi == 0),
+                        ))
+
+                buttons = []
+                for gi, gene in enumerate(genes):
+                    vis = [False] * (traces_per_gene * len(genes))
+                    start = gi * traces_per_gene
+                    for k in range(traces_per_gene):
+                        vis[start + k] = True
+
+                    buttons.append(dict(
+                        label=gene,
+                        method="update",
+                        args=[
+                            {"visible": vis},
+                            {"title": f"Violin: {gene} by cluster"}
+                        ],
+                    ))
+
+                fig.update_layout(
+                    title=f"Violin: {genes[0]} by cluster",
+                    height=650,
+                    margin=dict(l=20, r=20, t=70, b=20),
+                    xaxis_title="Cluster",
+                    yaxis_title="Expression",
+                    violinmode="group",
+                    updatemenus=[dict(
+                        type="dropdown",
+                        x=0.01,
+                        y=1.15,
+                        xanchor="left",
+                        yanchor="top",
+                        buttons=buttons,
+                    )],
+                )
+                return fig
+
+            def dot_plot_per_cluster(df: pd.DataFrame, genes: list[str]) -> go.Figure:
+                genes = [g for g in genes if g in df.columns]
+                if not genes:
+                    raise KeyError("None of the selected genes exist in the gene-expression JSON.")
+
+                clusters = sorted(df["cluster"].unique(), key=_cluster_sort_key)
+
+                # stats: mean expr + pct expressing (>0)
+                rows = []
+                for c in clusters:
+                    sub = df[df["cluster"] == c]
+                    for g in genes:
+                        v = pd.to_numeric(sub[g], errors="coerce").fillna(0.0)
+                        mean_expr = float(v.mean())
+                        pct_expr = float((v > 0).mean())  # 0..1
+                        rows.append((c, g, mean_expr, pct_expr))
+
+                stats = pd.DataFrame(rows, columns=["cluster", "gene", "mean_expr", "pct_expr"])
+
+                # convert to plotly arrays
+                x = stats["gene"].tolist()
+                y = stats["cluster"].tolist()
+                color = stats["mean_expr"].to_numpy()
+                size = (stats["pct_expr"].to_numpy() * 30.0) + 3.0  # scale sizes
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=x,
+                    y=y,
+                    mode="markers",
+                    marker=dict(
+                        size=size,
+                        color=color,
+                        colorscale="Viridis",
+                        showscale=True,
+                        colorbar=dict(title="Mean expr"),
+                        sizemode="diameter",
+                    ),
+                    hovertemplate="cluster=%{y}<br>gene=%{x}<br>mean=%{marker.color:.3f}<extra></extra>",
+                    showlegend=False,
+                ))
+
+                fig.update_layout(
+                    title="Dot Plot (per cluster)",
+                    height=650,
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    xaxis_title="Gene",
+                    yaxis_title="Cluster",
+                )
+                return fig
+
+            def load_plot_shim():
+                # 1) write JSON for current selected genes (your function)
+                gene_expression(adata, selected_genes)  # make sure this writes to the figures json
+
+                pt = plot_type.value
+                genes_label = ", ".join(selected_genes[:5]) if selected_genes else "(no genes selected)"
+                plot_status.text = f"Loaded: {pt} | Genes: {genes_label}"
+                ui.notify(f"Loading {pt}", color="info")
+
+                try:
+                    # 2) load JSON -> df
+                    df = load_gene_expression_df(SELECTED_PROJECT_PATH)
+
+                    # 3) plot per cluster
+                    if pt == "Feature Plot":
+                        if not selected_genes:
+                            raise ValueError("Select at least one gene for Feature Plot.")
+                        gene = selected_genes[0]
+                        fig = feature_plot_multi_gene(df, selected_genes)
+
+                    elif pt == "Violin Plot":
+                        if not selected_genes:
+                            raise ValueError("Select at least one gene for Violin Plot.")
+                        gene = selected_genes[0]
+                        fig = violin_plot_multi_gene(df, selected_genes)
+
+                    else:  # Dot Plot
+                        if not selected_genes:
+                            raise ValueError("Select at least one gene for Dot Plot.")
+                        # keep it readable
+                        genes = selected_genes[:12]
+                        fig = dot_plot_per_cluster(df, genes)
+
+                    plot_el.figure = fig
+                    plot_el.update()
+
+                except Exception as e:
+                    plot_status.text = f"Failed to load plot: {e}"
+                    ui.notify(f"Plot failed: {e}", color="negative")
+                    return
+
                 plot_name_btn.text = pt
+
 
             # keep the label button synced even before loading (when user changes radio)
             def on_plot_type_change():

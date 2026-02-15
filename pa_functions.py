@@ -155,6 +155,7 @@ def do_clustering(adata, resolution):
             f.truncate()
         print("Added clustering resolution to project values")
         
+        adata.write_h5ad(f"{project_path}/cellborg-cli/adata_clustered.h5ad")
 
         clusters = clusters.to_list()
         print(f"cluster: {type(clusters)}", clusters)
