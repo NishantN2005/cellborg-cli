@@ -26,7 +26,8 @@ from pa_functions import (
     read_adata,
     init_project,
     do_clustering,
-    gene_expression
+    gene_expression,
+    annotations,
 )
 
 PROJECTS_DIR = Path("projects")
@@ -75,6 +76,38 @@ def existing_titles() -> set[str]:
         if md and md.get("project_title"):
             titles.add(str(md["project_title"]).strip())
     return titles
+
+
+# -----------------------------
+# Annotation helpers
+# -----------------------------
+def _get_cluster_series_from_adata(adata) -> pd.Series:
+    for key in ("leiden", "cluster", "clusters", "louvain"):
+        if key in adata.obs.columns:
+            return adata.obs[key].astype(str)
+    for key in adata.obs.columns:
+        lk = key.lower()
+        if "cluster" in lk or "leiden" in lk or "louvain" in lk:
+            return adata.obs[key].astype(str)
+    raise KeyError("Could not find cluster labels in adata.obs (expected 'leiden' or 'cluster').")
+
+
+def _cluster_sort_key(x: str):
+    try:
+        return (0, int(x))
+    except Exception:
+        return (1, str(x))
+
+
+def _load_existing_annotations(project_path: str | Path) -> dict:
+    p = Path(project_path) / "cellborg-cli" / "cluster_annotations.json"
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
 
 
 # ------------------------------
@@ -256,13 +289,7 @@ def umap_scatter_figure_from_dict(umap_dict: dict, title="UMAP (Leiden clusters)
 
     df = df.dropna(subset=["UMAP1", "UMAP2"])
 
-    def _cluster_key(x: str):
-        try:
-            return (0, int(x))
-        except Exception:
-            return (1, x)
-
-    clusters = sorted(df["cluster"].unique(), key=_cluster_key)
+    clusters = sorted(df["cluster"].unique(), key=_cluster_sort_key)
 
     fig = go.Figure()
     for c in clusters:
@@ -403,7 +430,6 @@ async def add_project() -> None:
         desc_input = ui.textarea().style("height: 100px; width: 100%;")
 
         def save():
-            # NOTE: fixed key "project_path" (your old code used "projzect_path")
             md = {
                 "original_folder_name": folder.name,
                 "project_path": str(dest),
@@ -438,8 +464,7 @@ def dashboard_page():
         global dialog
         dialog = d
 
-    dark = ui.dark_mode()
-    dark.enable()
+    ui.dark_mode().enable()
 
     with ui.row().style(
         """
@@ -490,8 +515,7 @@ def qc_page():
         ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
         return
 
-    dark = ui.dark_mode()
-    dark.enable()
+    ui.dark_mode().enable()
 
     ui.label("QC Runner").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
     ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
@@ -677,14 +701,13 @@ def qc_page():
             save_btn.disable()
             ui.notify("Saving QC…", color="info")
 
-            # update metadata status
+            # update metadata status (kept as you had it)
             md_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "metadata.json"
             if md_path.exists():
                 try:
                     md = json.loads(md_path.read_text(encoding="utf-8"))
                     md["status"] = "PROC_ANNO"
                     md_path.write_text(json.dumps(md, indent=4), encoding="utf-8")
-                    # update selected project in memory too
                     SELECTED_PROJECT.update(md)
                 except Exception as e:
                     print(f"Failed to update metadata.json: {e}")
@@ -704,7 +727,7 @@ def qc_page():
 
 @ui.page("/pca")
 def pca_page():
-    PCA_DONE = False  # global flag to track if PCA has been done (enables "Next" button)
+    PCA_DONE = False
     SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
 
     if not SELECTED_PROJECT_PATH:
@@ -712,12 +735,9 @@ def pca_page():
         ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
         return
 
-    dark = ui.dark_mode()
-    dark.enable()
+    ui.dark_mode().enable()
 
     ui.label("Processing and Annotation").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
-    #ui.label(f"Project: {SELECTED_PROJECT.get('project_title', '')}").style("color:#ddd;")
-    #ui.label(SELECTED_PROJECT.get("project_description", "")).style("color:#bbb;")
     ui.separator().style("opacity:0.25; margin: 12px 0;")
 
     adata_qc_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_qc.h5ad"
@@ -726,14 +746,11 @@ def pca_page():
         ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
         return
 
-    # Load + init once per page load
     adata = read_adata(adata_qc_path)
     init_project(SELECTED_PROJECT_PATH, adata)
 
-    # Controls: resolution slider + run button
     with ui.row().classes("w-full items-center").style("gap:16px;"):
         ui.label("Leiden resolution").style("color:#ddd; min-width:160px;")
-
         res_slider = ui.slider(min=0.1, max=2.0, value=0.8, step=0.05).props("label-always").style("flex:1;")
         res_label = ui.label("0.80").style("color:#ddd; width:70px; text-align:right;")
         run_btn = ui.button("Run clustering").style("min-width:170px;")
@@ -750,16 +767,19 @@ def pca_page():
         status_lbl = ui.label("Adjust resolution and click “Run clustering” to render UMAP.").style("color:#bbb;")
         umap_plot = ui.plotly(go.Figure()).style("width:100%;")
 
+    next_btn = ui.button("Next →", on_click=lambda: ui.navigate.to("/anno")).props("unelevated")
+    next_btn.disable()
+
     async def run_and_render():
         nonlocal PCA_DONE
         PCA_DONE = False
         run_btn.disable()
+        next_btn.disable()
         res = float(res_slider.value)
         status_lbl.text = f"Clustering at resolution {res:.2f}…"
         try:
             await asyncio.to_thread(do_clustering, adata, res)
 
-            # load UMAP json + plot (each cluster different color via per-trace split)
             umap_dict = load_umap_dict(SELECTED_PROJECT_PATH, res)
             fig = umap_scatter_figure_from_dict(umap_dict, title=f"UMAP (Leiden res={res:.2f})")
 
@@ -767,27 +787,16 @@ def pca_page():
             umap_plot.update()
             status_lbl.text = f"Rendered UMAP for resolution {res:.2f}"
             PCA_DONE = True
+            next_btn.enable()
         except Exception as e:
             status_lbl.text = f"Failed: {e}"
             ui.notify(f"PA failed: {e}", color="negative")
-        finally:             
-            next_btn.enable()
-            run_btn.enable() 
+        finally:
+            run_btn.enable()
 
     run_btn.on("click", lambda e: asyncio.create_task(run_and_render()))
 
-    next_btn = ui.button(
-        'Next →',
-        on_click=lambda: ui.navigate.to("/anno"),
-    ).props('unelevated')
-    next_btn.disable()  # default locked
-
-    # enable if PCA already completed
-    if PCA_DONE:
-        print("PCA already done, enabling Next button")
-        next_btn.enable()
-
-    with ui.row().classes('w-full justify-end mt-6'):
+    with ui.row().classes("w-full justify-end mt-6"):
         next_btn
 
 
@@ -795,7 +804,6 @@ def pca_page():
 def annotation_page():
     ui.dark_mode().enable()
 
-    # ---- locate project + gene list ----
     SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
     if not SELECTED_PROJECT_PATH:
         ui.label("No project selected. Go back and select one.").style("color:#fbbf24;")
@@ -820,17 +828,14 @@ def annotation_page():
 
     genes_upper = [(g, g.upper()) for g in gene_list]
 
-    #------ premptively load adata -------
     adata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_clustered.h5ad"
     if not adata_path.exists():
         ui.label("Clustered dataset not found. Please run PA first.").style("color:#fbbf24;")
         ui.button("Back to Projects", on_click=lambda: ui.navigate.to("/")).props("flat")
-        return 
+        return
     adata = read_adata(adata_path)
-    
-    ui.label("Annotations").style(
-        "font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;"
-    )
+
+    ui.label("Annotations").style("font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;")
     ui.separator().style("opacity:0.25; margin: 12px 0;")
 
     with ui.row().classes("w-full").style("gap:18px; padding:12px; height: calc(100vh - 120px);"):
@@ -948,6 +953,75 @@ def annotation_page():
             )
 
             render_chips()
+
+            # ---- Annotate clusters section ----
+            ui.separator().style("opacity:0.25; margin: 10px 0;")
+            ui.label("Annotate Clusters").style("color:#e5e7eb; font-weight:800;")
+
+            try:
+                cluster_series = _get_cluster_series_from_adata(adata)
+                cluster_ids = sorted(cluster_series.unique().tolist(), key=_cluster_sort_key)
+            except Exception as e:
+                cluster_ids = []
+                ui.label(f"Could not load clusters: {e}").style("color:#fbbf24;")
+
+            existing_ann = _load_existing_annotations(SELECTED_PROJECT_PATH)
+
+            annot_card = ui.card().classes("w-full").style(
+                "padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+            )
+
+            cluster_inputs: dict[str, any] = {}
+
+            with annot_card:
+                if not cluster_ids:
+                    ui.label("No clusters found. Run PA first.").style("color:#9ca3af;")
+                else:
+                    with ui.column().style("max-height: 280px; overflow-y: auto; padding-right:6px; gap:10px;"):
+                        for cid in cluster_ids:
+                            with ui.row().classes("w-full items-center").style("gap:12px;"):
+                                ui.label(f"Cluster {cid}:").style("color:#e5e7eb; width:120px;")
+                                inp = ui.input(
+                                    value=str(existing_ann.get(str(cid), "")),
+                                    placeholder="e.g., T cells, Fibroblasts, ..."
+                                ).props("outlined dense").style("flex:1;")
+                                cluster_inputs[str(cid)] = inp
+
+            with ui.row().classes("w-full").style("gap:12px; margin-top:10px;"):
+                save_ann_btn = ui.button("Save").style(
+                    "flex:1; height:44px; border-radius:8px; background:#41c99a; color:#0b1220; font-weight:900;"
+                )
+                next_page_btn = ui.button("Next Page").style(
+                    "flex:1; height:44px; border-radius:8px; background:#111827; color:#e5e7eb; font-weight:900;"
+                )
+
+            def _save_cluster_annotations():
+                if not cluster_inputs:
+                    ui.notify("No cluster inputs to save.", color="negative")
+                    return
+                try:
+                    annotations_dict: dict[str, str] = {}
+                    for cid, inp in cluster_inputs.items():
+                        annotations_dict[str(cid)] = (inp.value or "").strip()
+
+                    # persist mapping for UI reload
+                    ann_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "cluster_annotations.json"
+                    ann_path.parent.mkdir(parents=True, exist_ok=True)
+                    ann_path.write_text(json.dumps(annotations_dict, indent=2), encoding="utf-8")
+
+                    # call your backend writer (umap_annotations.json etc.)
+                    annotations(adata, annotations_dict)
+
+                    # save updated adata
+                    adata_out = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_annotated.h5ad"
+                    adata.write(adata_out)
+
+                    ui.notify("Saved annotations successfully", color="positive")
+                except Exception as e:
+                    ui.notify(f"Annotation save failed: {e}", color="negative")
+
+            save_ann_btn.on("click", lambda e: _save_cluster_annotations())
+            next_page_btn.on("click", lambda e: ui.navigate.to("/"))
             hide_dropdown()
 
         # RIGHT COLUMN
@@ -963,28 +1037,19 @@ def annotation_page():
                 plot_status = ui.label("Choose a plot type and click Load Plot.").style("color:#9ca3af;")
                 plot_el = ui.plotly(go.Figure()).style("width:100%; height:100%;")
 
-            # ---- buttons under chart ----
             with ui.row().classes("w-full").style("gap:12px;"):
                 cluster_btn = ui.button("Cluster Plot").style(
                     "flex:1; height:48px; border-radius:8px; background:#41c99a; color:#0b1220; font-weight:800;"
                 )
 
-                plot_name_btn = ui.button(
-                    plot_type.value,
-                    on_click=lambda: (
-                        print(f"{plot_type.value} clicked"),
-                        ui.notify(f"{plot_type.value} clicked", color="info"),
-                    ),
-                ).style(
+                plot_name_btn = ui.button(plot_type.value).style(
                     "flex:1; height:48px; border-radius:8px; background:#41c99a; color:#0b1220; font-weight:800;"
                 )
 
             async def load_cluster_plot():
-                # IMPORTANT: always enter a slot when updating UI from async handlers
                 with plot_card:
                     cluster_btn.disable()
                     try:
-                        print('------------ Loading cluster plot ---', pv.get("clust_resolution"))
                         res_raw = pv.get("clust_resolution", None)
                         if res_raw is None:
                             plot_status.text = 'Missing "clust_resolution" in project_values.json'
@@ -999,7 +1064,6 @@ def annotation_page():
                             return
 
                         plot_status.text = f"Loading cluster UMAP (res={res:.2f})…"
-
                         umap_dict = load_umap_dict(SELECTED_PROJECT_PATH, res)
                         fig = umap_scatter_figure_from_dict(umap_dict, title=f"UMAP (Leiden res={res:.2f})")
 
@@ -1008,21 +1072,14 @@ def annotation_page():
 
                         plot_status.text = f"Loaded cluster UMAP (res={res:.2f})"
                         ui.notify("Loaded cluster plot", color="positive")
-
                     except Exception as e:
                         plot_status.text = f"Failed to load cluster plot: {e}"
                         ui.notify(f"Cluster plot failed: {e}", color="negative")
                     finally:
                         cluster_btn.enable()
 
-            # DON’T use asyncio.create_task here; keep NiceGUI context intact
-            cluster_btn.on("click", lambda e: load_cluster_plot())
-
-            def _cluster_sort_key(x: str):
-                try:
-                    return (0, int(x))
-                except Exception:
-                    return (1, str(x))
+            # IMPORTANT: pass async function directly (do NOT wrap in lambda)
+            cluster_btn.on("click", load_cluster_plot)
 
             def load_gene_expression_df(project_path: str | Path) -> pd.DataFrame:
                 p = Path(project_path) / "cellborg-cli" / "figures" / "gene_expression_per_cell_with_clusters.json"
@@ -1030,7 +1087,6 @@ def annotation_page():
                     raise FileNotFoundError(f"Gene expression json not found: {p}")
                 data = json.loads(p.read_text(encoding="utf-8"))
                 df = pd.DataFrame.from_dict(data, orient="index")
-                # normalize types
                 df["UMAP1"] = pd.to_numeric(df.get("UMAP1"), errors="coerce")
                 df["UMAP2"] = pd.to_numeric(df.get("UMAP2"), errors="coerce")
                 df["cluster"] = df.get("cluster").astype(str)
@@ -1042,21 +1098,15 @@ def annotation_page():
                 if not genes:
                     raise KeyError("None of the selected genes exist in the gene-expression JSON.")
 
-                # numeric + fill
                 for g in genes:
                     df[g] = pd.to_numeric(df[g], errors="coerce").fillna(0.0)
 
                 clusters = sorted(df["cluster"].unique(), key=_cluster_sort_key)
-
                 fig = go.Figure()
 
-                # trace bookkeeping: for each gene, we add:
-                # - one Scattergl per cluster
-                # - one hidden "colorbar" trace
-                traces_per_gene = len(clusters) + 1
+                traces_per_gene = len(clusters) + 1  # clusters + colorbar trace
 
                 for gi, gene in enumerate(genes):
-                    # cluster traces
                     for c in clusters:
                         sub = df[df["cluster"] == c]
                         fig.add_trace(go.Scattergl(
@@ -1064,17 +1114,11 @@ def annotation_page():
                             y=sub["UMAP2"],
                             mode="markers",
                             name=f"Cluster {c}",
-                            marker=dict(
-                                size=3,
-                                color=sub[gene],
-                                colorscale="Viridis",
-                                showscale=False,   # only show on the gene colorbar trace
-                            ),
+                            marker=dict(size=3, color=sub[gene], colorscale="Viridis", showscale=False),
                             hovertemplate=f"cluster={c}<br>{gene}=%{{marker.color:.3f}}<extra></extra>",
                             visible=(gi == 0),
                         ))
 
-                    # shared colorbar trace for this gene
                     gmin = float(df[gene].min())
                     gmax = float(df[gene].max())
                     fig.add_trace(go.Scattergl(
@@ -1091,21 +1135,16 @@ def annotation_page():
                         visible=(gi == 0),
                     ))
 
-                # dropdown: toggle visibility gene-by-gene
                 buttons = []
                 for gi, gene in enumerate(genes):
                     vis = [False] * (traces_per_gene * len(genes))
                     start = gi * traces_per_gene
                     for k in range(traces_per_gene):
                         vis[start + k] = True
-
                     buttons.append(dict(
                         label=gene,
                         method="update",
-                        args=[
-                            {"visible": vis},
-                            {"title": f"Feature Plot: {gene} (per cluster)"}
-                        ],
+                        args=[{"visible": vis}, {"title": f"Feature Plot: {gene} (per cluster)"}],
                     ))
 
                 fig.update_layout(
@@ -1115,10 +1154,8 @@ def annotation_page():
                     legend=dict(itemsizing="constant"),
                     updatemenus=[dict(
                         type="dropdown",
-                        x=0.01,
-                        y=1.15,
-                        xanchor="left",
-                        yanchor="top",
+                        x=0.01, y=1.15,
+                        xanchor="left", yanchor="top",
                         buttons=buttons,
                     )],
                 )
@@ -1135,7 +1172,6 @@ def annotation_page():
                     df[g] = pd.to_numeric(df[g], errors="coerce").fillna(0.0)
 
                 clusters = sorted(df["cluster"].unique(), key=_cluster_sort_key)
-
                 fig = go.Figure()
 
                 traces_per_gene = len(clusters)
@@ -1158,14 +1194,10 @@ def annotation_page():
                     start = gi * traces_per_gene
                     for k in range(traces_per_gene):
                         vis[start + k] = True
-
                     buttons.append(dict(
                         label=gene,
                         method="update",
-                        args=[
-                            {"visible": vis},
-                            {"title": f"Violin: {gene} by cluster"}
-                        ],
+                        args=[{"visible": vis}, {"title": f"Violin: {gene} by cluster"}],
                     ))
 
                 fig.update_layout(
@@ -1177,10 +1209,8 @@ def annotation_page():
                     violinmode="group",
                     updatemenus=[dict(
                         type="dropdown",
-                        x=0.01,
-                        y=1.15,
-                        xanchor="left",
-                        yanchor="top",
+                        x=0.01, y=1.15,
+                        xanchor="left", yanchor="top",
                         buttons=buttons,
                     )],
                 )
@@ -1193,23 +1223,20 @@ def annotation_page():
 
                 clusters = sorted(df["cluster"].unique(), key=_cluster_sort_key)
 
-                # stats: mean expr + pct expressing (>0)
                 rows = []
                 for c in clusters:
                     sub = df[df["cluster"] == c]
                     for g in genes:
                         v = pd.to_numeric(sub[g], errors="coerce").fillna(0.0)
                         mean_expr = float(v.mean())
-                        pct_expr = float((v > 0).mean())  # 0..1
+                        pct_expr = float((v > 0).mean())
                         rows.append((c, g, mean_expr, pct_expr))
 
                 stats = pd.DataFrame(rows, columns=["cluster", "gene", "mean_expr", "pct_expr"])
-
-                # convert to plotly arrays
                 x = stats["gene"].tolist()
                 y = stats["cluster"].tolist()
                 color = stats["mean_expr"].to_numpy()
-                size = (stats["pct_expr"].to_numpy() * 30.0) + 3.0  # scale sizes
+                size = (stats["pct_expr"].to_numpy() * 30.0) + 3.0
 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
@@ -1238,8 +1265,7 @@ def annotation_page():
                 return fig
 
             def load_plot_shim():
-                # 1) write JSON for current selected genes (your function)
-                gene_expression(adata, selected_genes)  # make sure this writes to the figures json
+                gene_expression(adata, selected_genes)
 
                 pt = plot_type.value
                 genes_label = ", ".join(selected_genes[:5]) if selected_genes else "(no genes selected)"
@@ -1247,28 +1273,22 @@ def annotation_page():
                 ui.notify(f"Loading {pt}", color="info")
 
                 try:
-                    # 2) load JSON -> df
                     df = load_gene_expression_df(SELECTED_PROJECT_PATH)
 
-                    # 3) plot per cluster
                     if pt == "Feature Plot":
                         if not selected_genes:
                             raise ValueError("Select at least one gene for Feature Plot.")
-                        gene = selected_genes[0]
                         fig = feature_plot_multi_gene(df, selected_genes)
 
                     elif pt == "Violin Plot":
                         if not selected_genes:
                             raise ValueError("Select at least one gene for Violin Plot.")
-                        gene = selected_genes[0]
                         fig = violin_plot_multi_gene(df, selected_genes)
 
-                    else:  # Dot Plot
+                    else:
                         if not selected_genes:
                             raise ValueError("Select at least one gene for Dot Plot.")
-                        # keep it readable
-                        genes = selected_genes[:12]
-                        fig = dot_plot_per_cluster(df, genes)
+                        fig = dot_plot_per_cluster(df, selected_genes[:12])
 
                     plot_el.figure = fig
                     plot_el.update()
@@ -1280,8 +1300,6 @@ def annotation_page():
 
                 plot_name_btn.text = pt
 
-
-            # keep the label button synced even before loading (when user changes radio)
             def on_plot_type_change():
                 plot_name_btn.text = plot_type.value
 
@@ -1289,6 +1307,7 @@ def annotation_page():
             on_plot_type_change()
 
             load_btn.on("click", lambda e: load_plot_shim())
+
 
 # -----------------------------
 # run
