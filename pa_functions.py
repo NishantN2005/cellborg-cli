@@ -164,7 +164,7 @@ def do_clustering(adata, resolution):
         print('ERROR: ',str(err))
 
 
-def gene_expression(adata, gene_list):
+def gene_expression(project_path, adata, gene_list):
     try:
         print('----Starting Gene Expression----')
         gene_mask = adata.var_names.isin(gene_list)

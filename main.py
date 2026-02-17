@@ -30,6 +30,8 @@ from pa_functions import (
     annotations,
 )
 
+from heatmap_functions import compute_cluster_gene_heatmap, prepare_heatmap_matrix
+
 PROJECTS_DIR = Path("projects")
 SELECTED_PROJECT: dict | None = None
 
@@ -402,7 +404,7 @@ def project_details():
             ui.button("Run QC", on_click=lambda: ui.navigate.to("/qc")).style("flex:1;")
         elif status in ("PROC_ANNO", "PA"):
             ui.button("Run PA", on_click=lambda: ui.navigate.to("/pca")).style("flex:1;")
-        ui.button("Run Analysis").style("flex:1;")
+        ui.button("Run Analysis", on_click=lambda: ui.navigate.to("/analysis")).style("flex:1;")
 
 
 async def add_project() -> None:
@@ -1021,7 +1023,19 @@ def annotation_page():
                     ui.notify(f"Annotation save failed: {e}", color="negative")
 
             save_ann_btn.on("click", lambda e: _save_cluster_annotations())
-            next_page_btn.on("click", lambda e: ui.navigate.to("/"))
+
+            def finish_annotations():
+                metadata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "metadata.json"
+                if metadata_path.exists():
+                    try:
+                        md = json.loads(metadata_path.read_text(encoding="utf-8"))
+                        md["status"] = "ANNO_DONE"
+                        metadata_path.write_text(json.dumps(md, indent=4), encoding="utf-8")
+                        SELECTED_PROJECT.update(md)
+                    except Exception as e:
+                        print(f"Failed to update metadata.json: {e}")
+                ui.navigate.to("/")
+            next_page_btn.on("click", lambda e: finish_annotations())
             hide_dropdown()
 
         # RIGHT COLUMN
@@ -1264,8 +1278,8 @@ def annotation_page():
                 )
                 return fig
 
-            def load_plot_shim():
-                gene_expression(adata, selected_genes)
+            def load_plot():
+                gene_expression(SELECTED_PROJECT_PATH,adata, selected_genes)
 
                 pt = plot_type.value
                 genes_label = ", ".join(selected_genes[:5]) if selected_genes else "(no genes selected)"
@@ -1306,7 +1320,1294 @@ def annotation_page():
             plot_type.on("change", lambda e: on_plot_type_change())
             on_plot_type_change()
 
-            load_btn.on("click", lambda e: load_plot_shim())
+            load_btn.on("click", lambda e: load_plot())
+
+@ui.page("/analysis")
+def analysis_page():
+    ui.dark_mode().enable()
+
+    ui.label("Analysis").style(
+        "font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;"
+    )
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
+    # --- helper to build a "pop-up" tile card ---
+    def analysis_tile(title: str, subtitle: str, icon_name: str, accent: str, on_click=None):
+        # nice hover pop + glow
+        base = (
+            "w-full h-full p-6 rounded-2xl "
+            "bg-gray-900/60 border border-white/10 "
+            "transition-all duration-200 ease-out "
+            "hover:-translate-y-1 hover:scale-[1.01] hover:border-white/20 "
+            "hover:shadow-2xl cursor-pointer select-none"
+        )
+
+        card = ui.card().classes(base)
+        if on_click:
+            card.on("click", on_click)
+
+        with card:
+            # icon (upper-left)
+            ui.icon(icon_name).style(
+                f"font-size: 28px; color: {accent}; margin-bottom: 12px;"
+            )
+
+            # title + subtitle
+            ui.label(title).style(
+                "font-size: 22px; font-weight: 800; color: #e5e7eb; line-height: 1.1;"
+            )
+            ui.label(subtitle).style(
+                "margin-top: 8px; color: #94a3b8; font-size: 14px;"
+            )
+
+            # little accent bar at bottom
+            ui.separator().style(f"opacity:0.25; margin: 16px 0 0 0;")
+            ui.element("div").style(
+                f"height: 6px; border-radius: 999px; background: {accent}; opacity: 0.9; margin-top: 14px;"
+            )
+
+        return card
+
+    # --- layout: 2x2 big tiles (responsive) ---
+    with ui.element("div").classes("w-full"):
+        with ui.element("div").classes("grid grid-cols-1 md:grid-cols-2 gap-6"):
+            analysis_tile(
+                "Heatmap",
+                "Cluster × gene (or module) expression overview.",
+                "grid_on",
+                "#4ecda4",
+                on_click=lambda: ui.navigate.to("/heatmap"),
+            )
+
+            analysis_tile(
+                "Pseudotime",
+                "Trajectory inference and lineage progression plots.",
+                "timeline",
+                "#60a5fa",
+                on_click=lambda: ui.navigate.to("/pseudotime"),
+            )
+
+            analysis_tile(
+                "Feature Expression",
+                "Marker / gene expression across embeddings and groups.",
+                "scatter_plot",
+                "#fbbf24",
+                on_click=lambda: ui.navigate.to("/feature"),
+            )
+
+            analysis_tile(
+                "Receptor–Ligand",
+                "Cell–cell communication and interaction scoring.",
+                "link",
+                "#fb7185",
+                on_click=lambda: ui.navigate.to("/receptor_ligand"),
+            )
+
+@ui.page("/heatmap")
+def heatmap_page():
+    ui.dark_mode().enable()
+
+    ui.label("Heatmap").style(
+        "font-size: 32px; font-weight: 800; color: #4ecda4; margin: 12px 0;"
+    )
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
+    # ----------------------------
+    # Resolve project + load gene list
+    # ----------------------------
+    SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
+    if not SELECTED_PROJECT_PATH:
+        ui.label("No project selected. Go back and select one.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    pv_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "project_values.json"
+    if not pv_path.exists():
+        ui.label("project_values.json not found. Run PA first.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    try:
+        pv = json.loads(pv_path.read_text(encoding="utf-8"))
+        gene_list = pv.get("gene_list", [])
+        if not isinstance(gene_list, list):
+            gene_list = []
+        gene_list = [str(g) for g in gene_list]
+    except Exception as e:
+        ui.label(f"Failed to read project_values.json: {e}").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    genes_upper = [(g, g.upper()) for g in gene_list]
+
+    # Load clustered adata (needed for heatmap compute)
+    adata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_annotated.h5ad"
+    if not adata_path.exists():
+        ui.label("adata_annotated.h5ad not found. Run PA first.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    adata = read_adata(adata_path)
+
+    # ----------------------------
+    # Gene search UI (same as /anno)
+    # ----------------------------
+    ui.label("Gene search").style("color:#e5e7eb; font-weight:700; margin-top: 6px;")
+
+    chips_row = ui.row().classes("items-center w-full").style(
+        "gap:10px; padding:10px; border:1px solid #374151; border-radius:8px; background:#0b1220;"
+    )
+    selected_genes: list[str] = []
+
+    def render_chips():
+        chips_row.clear()
+        with chips_row:
+            if not selected_genes:
+                ui.label("Selected genes will appear here.").style("color:#9ca3af;")
+                return
+            for g in selected_genes:
+                with ui.row().classes("items-center").style(
+                    "gap:8px; padding:7px 10px; border:1px solid #4b5563; border-radius:8px; background:#111827;"
+                ):
+                    ui.label(g).style("color:#e5e7eb; font-size:16px;")
+                    ui.button(
+                        icon="close",
+                        on_click=lambda gg=g: (selected_genes.remove(gg), render_chips()),
+                    ).props("flat dense").style("color:#ef4444;")
+
+    search_wrap = ui.column().classes("w-full").style("position:relative; max-width: 820px;")
+    with search_wrap:
+        search_in = (
+            ui.input(placeholder="Search gene (e.g., Dnpep, Rnpepl1, Sept2)")
+            .props("outlined clearable")
+            .style("width:100%;")
+        )
+
+        dropdown = ui.card().classes("w-full").style(
+            """
+            position:absolute;
+            top:52px;
+            left:0;
+            right:0;
+            z-index:9999;
+            padding:6px;
+            border:1px solid #374151;
+            border-radius:10px;
+            background:#0b1220;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+            max-height: 260px;
+            overflow-y: auto;
+            display:none;
+            """
+        )
+
+    def hide_dropdown():
+        dropdown.style("display:none;")
+
+    def show_dropdown():
+        dropdown.style("display:block;")
+
+    def add_gene(g: str):
+        if g not in selected_genes:
+            selected_genes.append(g)
+            render_chips()
+        search_in.value = ""
+        hide_dropdown()
+        ui.notify(f"Selected {g}", color="positive")
+
+    def render_dropdown(matches: list[str], query: str):
+        dropdown.clear()
+        q = (query or "").strip()
+        if not q:
+            hide_dropdown()
+            return
+        if not matches:
+            with dropdown:
+                ui.label(f'No matches for "{q}".').style("color:#9ca3af; padding:6px;")
+            show_dropdown()
+            return
+
+        with dropdown:
+            for g in matches[:20]:
+                ui.button(g, on_click=lambda gg=g: add_gene(gg)).props("flat dense").style(
+                    "width:100%; justify-content:flex-start; color:#e5e7eb; text-transform:none;"
+                )
+        show_dropdown()
+
+    def do_search(query: str):
+        q = (query or "").strip()
+        if not q:
+            render_dropdown([], "")
+            return
+        q_up = q.upper()
+        matches = [g for (g, gu) in genes_upper if q_up in gu]
+        render_dropdown(matches, q)
+
+    search_in.on("input", lambda e: do_search(search_in.value))
+    search_in.on("change", lambda e: do_search(search_in.value))
+
+    render_chips()
+    hide_dropdown()
+
+    # ----------------------------
+    # Controls (metric/scale/threshold) + Render button
+    # ----------------------------
+    ui.separator().style("opacity:0.25; margin: 14px 0;")
+
+    with ui.row().classes("w-full items-center").style("gap:14px; flex-wrap:wrap;"):
+        metric_sel = ui.select(
+            options={
+                "mean": "Mean expression",
+                "pct": "% expressing",
+            },
+            value="mean",
+            label="Metric",
+        ).props("outlined dense").style("min-width:220px;")
+
+        scale_sel = ui.select(
+            options={
+                "raw": "Raw",
+                "zscore": "Z-score (per gene)",
+            },
+            value="raw",
+            label="Scale",
+        ).props("outlined dense").style("min-width:240px;")
+
+
+
+        expr_thr = ui.number("Expr threshold (for % expressing)", value=0.0, format="%.3f").props("outlined dense").style(
+            "min-width:260px;"
+        )
+
+        render_btn = ui.button("Render heatmap").props("unelevated").style(
+            "height:40px; background:#41c99a; color:#0b1220; font-weight:900; border-radius:10px;"
+        )
+
+    # ----------------------------
+    # Plot area
+    # ----------------------------
+    plot_card = ui.card().classes("w-full").style(
+        "margin-top: 12px; padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+    )
+    with plot_card:
+        status = ui.label("Select genes and click Render heatmap.").style("color:#9ca3af;")
+        heatmap_el = ui.plotly(go.Figure()).style("width:100%; height: 720px;")
+
+    async def render_heatmap():
+        render_btn.disable()
+        with plot_card:
+            try:
+                if not selected_genes:
+                    ui.notify("Select at least one gene.", color="negative")
+                    return
+
+                status.text = "Computing heatmap…"
+                metric = str(metric_sel.value)
+                scale = str(scale_sel.value)
+                thr = float(expr_thr.value or 0.0)
+
+                # Heavy compute in background thread
+                def _work():
+                    res = compute_cluster_gene_heatmap(
+                        adata,
+                        selected_genes,
+                        cluster_key="leiden",     # change if needed
+                        use_layer=None,           # or "log1p" if you store it
+                        use_raw=False,            # set True if you want adata.raw
+                        expr_threshold=thr,
+                    )
+                    mat = prepare_heatmap_matrix(res, metric=metric, scale=scale)
+                    return res, mat
+
+                res, mat = await asyncio.to_thread(_work)
+
+                if mat.shape[1] == 0:
+                    status.text = "No selected genes were found in this dataset."
+                    ui.notify("None of the selected genes exist in adata.var_names.", color="negative")
+                    return
+
+                # Plotly heatmap
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Heatmap(
+                        z=mat.to_numpy(dtype=float),
+                        x=mat.columns.tolist(),
+                        y=mat.index.tolist(),
+                        hovertemplate="Cluster=%{y}<br>Gene=%{x}<br>Value=%{z:.4f}<extra></extra>",
+                        colorbar=dict(title=("Z" if scale == "zscore" else metric)),
+                    )
+                )
+                fig.update_layout(
+                    title=f"Heatmap ({'Mean expr' if metric=='mean' else '% expressing'}; {scale})",
+                    height=700,
+                    margin=dict(l=60, r=20, t=50, b=80),
+                    xaxis=dict(tickangle=45),
+                )
+
+                heatmap_el.figure = fig
+                heatmap_el.update()
+
+                missing = [g for g in selected_genes if g not in res.genes]
+                if missing:
+                    ui.notify(f"Missing genes (not found): {', '.join(missing[:8])}" + ("…" if len(missing) > 8 else ""), color="warning")
+
+                status.text = f"Rendered heatmap for {len(res.genes)} genes across {len(res.clusters)} clusters."
+                ui.notify("Heatmap rendered", color="positive")
+
+            except Exception as e:
+                status.text = f"Failed: {e}"
+                ui.notify(f"Heatmap failed: {e}", color="negative")
+            finally:
+                render_btn.enable()
+
+    render_btn.on("click", lambda e: asyncio.create_task(render_heatmap()))
+
+    ui.separator().style("opacity:0.25; margin: 14px 0;")
+    ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+
+@ui.page("/pseudotime")
+def pseudotime_page():
+    ui.dark_mode().enable()
+
+    ui.label("Pseudotime").style(
+        "font-size: 32px; font-weight: 800; color: #60a5fa; margin: 12px 0;"
+    )
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
+    SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
+    if not SELECTED_PROJECT_PATH:
+        ui.label("No project selected. Go back and select one.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    adata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_annotated.h5ad"
+    if not adata_path.exists():
+        ui.label("adata_annotated.h5ad not found. Run PA/Annotations first.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    # Load adata
+    try:
+        adata = read_adata(adata_path)
+    except Exception as e:
+        ui.notify(f"Failed to load adata: {e}", color="negative")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    # Cluster key
+    cluster_key = "leiden"
+    if cluster_key not in getattr(adata, "obs", {}):
+        # fallback attempt
+        try:
+            _ = _get_cluster_series_from_adata(adata)
+            # _get_cluster_series_from_adata returns a series but we still want a key name;
+            # if leiden missing, just pick first matching key
+            for k in adata.obs.columns:
+                lk = k.lower()
+                if "leiden" in lk or "cluster" in lk or "louvain" in lk:
+                    cluster_key = k
+                    break
+        except Exception:
+            cluster_key = None
+
+    # Root cluster options
+    try:
+        if cluster_key:
+            cluster_ids = sorted(adata.obs[cluster_key].astype(str).unique().tolist(), key=_cluster_sort_key)
+        else:
+            cluster_ids = []
+    except Exception:
+        cluster_ids = []
+
+    # Layout
+    with ui.row().classes("w-full").style("gap:18px; padding:12px; height: calc(100vh - 140px);"):
+        # LEFT: controls
+        with ui.column().style("width:520px; gap:12px;"):
+            ui.label("Controls").style("color:#e5e7eb; font-weight:800; font-size:18px;")
+
+            ctrl_card = ui.card().classes("w-full").style(
+                "padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+            )
+            with ctrl_card:
+                ui.label("Root selection").style("color:#9ca3af; font-weight:700;")
+
+                root_mode = ui.radio(
+                    options=["Root cluster", "Root cell id"],
+                    value="Root cluster",
+                ).props("inline").style("color:#e5e7eb;")
+
+                root_cluster_sel = ui.select(
+                    options=cluster_ids,
+                    value=(cluster_ids[0] if cluster_ids else None),
+                    label=f"Root cluster ({cluster_key or 'missing'})",
+                ).props("outlined dense").style("width:100%;")
+
+                root_cell_in = ui.input(
+                    label="Root cell id (index in adata.obs_names)",
+                    placeholder="Paste a cell id exactly (e.g., AAACCTG...)",
+                ).props("outlined clearable dense").style("width:100%;")
+
+                ui.separator().style("opacity:0.25; margin: 8px 0;")
+
+                neighbors_k = ui.number("Neighbors (k)", value=15, format="%.0f").props("outlined dense").style("width:100%;")
+                n_dcs = ui.number("Diffusion components", value=10, format="%.0f").props("outlined dense").style("width:100%;")
+
+                ui.separator().style("opacity:0.25; margin: 8px 0;")
+
+                color_mode = ui.select(
+                    options={
+                        "pseudotime": "Pseudotime",
+                        "cluster": "Cluster labels",
+                    },
+                    value="pseudotime",
+                    label="Color by",
+                ).props("outlined dense").style("width:100%;")
+
+                run_btn = ui.button("Compute pseudotime").props("unelevated").style(
+                    "width:100%; height:44px; border-radius:10px; background:#60a5fa; color:#0b1220; font-weight:900;"
+                )
+
+                ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat").style("width:100%;")
+
+            # enable/disable controls based on root mode
+            def sync_root_mode():
+                if root_mode.value == "Root cluster":
+                    root_cluster_sel.enable()
+                    root_cell_in.disable()
+                else:
+                    root_cluster_sel.disable()
+                    root_cell_in.enable()
+
+            root_mode.on("change", lambda e: sync_root_mode())
+            sync_root_mode()
+
+        # RIGHT: plot
+        with ui.column().style("flex:1; gap:12px;"):
+            ui.label("Trajectory view").style(
+                "font-size: 20px; font-weight: 800; color:#e5e7eb; text-align:center; margin-top:6px;"
+            )
+
+            plot_card = ui.card().classes("w-full").style(
+                "flex:1; padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+            )
+            with plot_card:
+                status = ui.label("Pick a root and click Compute pseudotime.").style("color:#9ca3af;")
+                plot_el = ui.plotly(go.Figure()).style("width:100%; height: 100%;")
+
+    def _plot_from_adata():
+        # needs UMAP coords
+        if "X_umap" in getattr(adata, "obsm", {}):
+            X = np.array(adata.obsm["X_umap"])
+        elif "umap" in getattr(adata, "obsm", {}):
+            X = np.array(adata.obsm["umap"])
+        else:
+            raise KeyError("UMAP coordinates not found in adata.obsm (expected 'X_umap'). Run UMAP first in PA pipeline.")
+
+        df = pd.DataFrame({
+            "UMAP1": X[:, 0],
+            "UMAP2": X[:, 1],
+        }, index=adata.obs_names.astype(str))
+
+        # color
+        if color_mode.value == "cluster":
+            if not cluster_key:
+                raise KeyError("No cluster key found in adata.obs to color by cluster.")
+            df["color"] = adata.obs[cluster_key].astype(str).values
+            # one trace per cluster for categorical colors
+            clusters = sorted(df["color"].unique().tolist(), key=_cluster_sort_key)
+            fig = go.Figure()
+            for c in clusters:
+                sub = df[df["color"] == c]
+                fig.add_trace(go.Scattergl(
+                    x=sub["UMAP1"], y=sub["UMAP2"],
+                    mode="markers",
+                    name=f"{cluster_key} {c}",
+                    marker=dict(size=3),
+                    hoverinfo="skip",
+                ))
+            title = f"Pseudotime view (colored by {cluster_key})"
+        else:
+            if "dpt_pseudotime" not in adata.obs.columns:
+                raise KeyError("dpt_pseudotime not found. Compute pseudotime first.")
+            pt = pd.to_numeric(adata.obs["dpt_pseudotime"], errors="coerce").fillna(0.0).to_numpy()
+            df["pt"] = pt
+            fig = go.Figure()
+            fig.add_trace(go.Scattergl(
+                x=df["UMAP1"], y=df["UMAP2"],
+                mode="markers",
+                marker=dict(
+                    size=3,
+                    color=df["pt"],
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(title="DPT"),
+                ),
+                hovertemplate="pt=%{marker.color:.4f}<extra></extra>",
+                showlegend=False,
+            ))
+            title = "Pseudotime (Scanpy DPT)"
+
+        fig.update_layout(
+            title=title,
+            height=760,
+            margin=dict(l=20, r=20, t=55, b=20),
+        )
+        fig.update_xaxes(title="UMAP1")
+        fig.update_yaxes(title="UMAP2")
+        return fig
+
+    async def _compute_pseudotime():
+        run_btn.disable()
+        try:
+            # Import scanpy lazily
+            try:
+                import scanpy as sc
+            except Exception as e:
+                status.text = f"Scanpy not available: {e}"
+                ui.notify("Scanpy is required for DPT pseudotime. Install: pip install scanpy", color="negative")
+                return
+
+            if cluster_key is None and root_mode.value == "Root cluster":
+                ui.notify("No clusters found in adata.obs to use as a root cluster.", color="negative")
+                return
+
+            status.text = "Computing neighbors / diffusion map / DPT…"
+
+            k = int(float(neighbors_k.value or 15))
+            ndc = int(float(n_dcs.value or 10))
+
+            def _work():
+                # neighbors on X_pca if exists else default
+                sc.pp.neighbors(adata, n_neighbors=max(2, k), use_rep=("X_pca" if "X_pca" in adata.obsm else None))
+                sc.tl.diffmap(adata, n_comps=max(2, ndc))
+
+                # set root
+                if root_mode.value == "Root cell id":
+                    rid = (root_cell_in.value or "").strip()
+                    if not rid:
+                        raise ValueError("Root cell id is empty.")
+                    if rid not in adata.obs_names:
+                        raise KeyError(f"Root cell id not found in adata.obs_names: {rid}")
+                    adata.uns["iroot"] = int(np.where(adata.obs_names == rid)[0][0])
+                else:
+                    rc = str(root_cluster_sel.value)
+                    # choose first cell in that cluster as root
+                    mask = (adata.obs[cluster_key].astype(str) == rc).to_numpy()
+                    idxs = np.where(mask)[0]
+                    if idxs.size == 0:
+                        raise ValueError(f"No cells found in root cluster {rc}.")
+                    adata.uns["iroot"] = int(idxs[0])
+
+                sc.tl.dpt(adata)  # creates adata.obs['dpt_pseudotime']
+                return True
+
+            await asyncio.to_thread(_work)
+
+            # plot
+            fig = _plot_from_adata()
+            plot_el.figure = fig
+            plot_el.update()
+            status.text = "Done. Pseudotime computed and rendered."
+            ui.notify("Pseudotime rendered", color="positive")
+
+        except Exception as e:
+            status.text = f"Failed: {e}"
+            ui.notify(f"Pseudotime failed: {e}", color="negative")
+        finally:
+            run_btn.enable()
+
+    run_btn.on("click", _compute_pseudotime)
+
+@ui.page("/feature")
+def feature_expression_page():
+    ui.dark_mode().enable()
+
+    ui.label("Feature Expression").style(
+        "font-size: 32px; font-weight: 800; color: #fbbf24; margin: 12px 0;"
+    )
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
+    # ----------------------------
+    # Resolve project + load gene list
+    # ----------------------------
+    SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
+    if not SELECTED_PROJECT_PATH:
+        ui.label("No project selected. Go back and select one.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    pv_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "project_values.json"
+    if not pv_path.exists():
+        ui.label("project_values.json not found. Run PA first.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    try:
+        pv = json.loads(pv_path.read_text(encoding="utf-8"))
+        gene_list = pv.get("gene_list", [])
+        if not isinstance(gene_list, list):
+            gene_list = []
+        gene_list = [str(g) for g in gene_list]
+    except Exception as e:
+        ui.label(f"Failed to read project_values.json: {e}").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    genes_upper = [(g, g.upper()) for g in gene_list]
+
+    # Optional: load adata (mostly for cluster key detection / sanity)
+    adata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_annotated.h5ad"
+    if not adata_path.exists():
+        ui.label("adata_annotated.h5ad not found. Run PA/Annotations first.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+    adata = read_adata(adata_path)
+
+    # ----------------------------
+    # Load gene expression DF from JSON written by your backend
+    # ----------------------------
+    def load_gene_expression_df(project_path: str | Path) -> pd.DataFrame:
+        print('------------------ project path ------------------', project_path)
+        p = Path(project_path) / "cellborg-cli" / "figures" / "gene_expression_per_cell_with_clusters.json"
+        if not p.exists():
+            raise FileNotFoundError(f"Gene expression json not found: {p}")
+        data = json.loads(p.read_text(encoding="utf-8"))
+        df = pd.DataFrame.from_dict(data, orient="index")
+        df["UMAP1"] = pd.to_numeric(df.get("UMAP1"), errors="coerce")
+        df["UMAP2"] = pd.to_numeric(df.get("UMAP2"), errors="coerce")
+        df["cluster"] = df.get("cluster").astype(str)
+        df = df.dropna(subset=["UMAP1", "UMAP2", "cluster"])
+        return df
+
+    # ----------------------------
+    # Gene search UI (same style as /anno & /heatmap)
+    # ----------------------------
+    ui.label("Gene search").style("color:#e5e7eb; font-weight:700; margin-top: 6px;")
+
+    chips_row = ui.row().classes("items-center w-full").style(
+        "gap:10px; padding:10px; border:1px solid #374151; border-radius:8px; background:#0b1220;"
+    )
+    selected_genes: list[str] = []
+
+    def render_chips():
+        chips_row.clear()
+        with chips_row:
+            if not selected_genes:
+                ui.label("Selected genes will appear here.").style("color:#9ca3af;")
+                return
+            for g in selected_genes:
+                with ui.row().classes("items-center").style(
+                    "gap:8px; padding:7px 10px; border:1px solid #4b5563; border-radius:8px; background:#111827;"
+                ):
+                    ui.label(g).style("color:#e5e7eb; font-size:16px;")
+                    ui.button(
+                        icon="close",
+                        on_click=lambda gg=g: (selected_genes.remove(gg), render_chips()),
+                    ).props("flat dense").style("color:#ef4444;")
+
+    search_wrap = ui.column().classes("w-full").style("position:relative; max-width: 820px;")
+    with search_wrap:
+        search_in = (
+            ui.input(placeholder="Search gene (e.g., Dnpep, Rnpepl1, Sept2)")
+            .props("outlined clearable")
+            .style("width:100%;")
+        )
+
+        dropdown = ui.card().classes("w-full").style(
+            """
+            position:absolute;
+            top:52px;
+            left:0;
+            right:0;
+            z-index:9999;
+            padding:6px;
+            border:1px solid #374151;
+            border-radius:10px;
+            background:#0b1220;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+            max-height: 260px;
+            overflow-y: auto;
+            display:none;
+            """
+        )
+
+    def hide_dropdown():
+        dropdown.style("display:none;")
+
+    def show_dropdown():
+        dropdown.style("display:block;")
+
+    def add_gene(g: str):
+        if g not in selected_genes:
+            selected_genes.append(g)
+            render_chips()
+        search_in.value = ""
+        hide_dropdown()
+        ui.notify(f"Selected {g}", color="positive")
+
+    def render_dropdown(matches: list[str], query: str):
+        dropdown.clear()
+        q = (query or "").strip()
+        if not q:
+            hide_dropdown()
+            return
+        if not matches:
+            with dropdown:
+                ui.label(f'No matches for "{q}".').style("color:#9ca3af; padding:6px;")
+            show_dropdown()
+            return
+
+        with dropdown:
+            for g in matches[:20]:
+                ui.button(g, on_click=lambda gg=g: add_gene(gg)).props("flat dense").style(
+                    "width:100%; justify-content:flex-start; color:#e5e7eb; text-transform:none;"
+                )
+        show_dropdown()
+
+    def do_search(query: str):
+        q = (query or "").strip()
+        if not q:
+            render_dropdown([], "")
+            return
+        q_up = q.upper()
+        matches = [g for (g, gu) in genes_upper if q_up in gu]
+        render_dropdown(matches, q)
+
+    search_in.on("input", lambda e: do_search(search_in.value))
+    search_in.on("change", lambda e: do_search(search_in.value))
+
+    render_chips()
+    hide_dropdown()
+
+    # ----------------------------
+    # Controls
+    # ----------------------------
+    ui.separator().style("opacity:0.25; margin: 14px 0;")
+
+    with ui.row().classes("w-full items-center").style("gap:14px; flex-wrap:wrap;"):
+        # behavior toggles
+        split_by_cluster = ui.switch("Split by cluster", value=False).style("color:#e5e7eb;")
+        log1p_toggle = ui.switch("log1p color", value=False).style("color:#e5e7eb;")
+
+        pt_size = ui.number("Point size", value=3, format="%.0f").props("outlined dense").style("width:180px;")
+        max_genes = ui.number("Max genes (dropdown)", value=25, format="%.0f").props("outlined dense").style("width:220px;")
+
+        render_btn = ui.button("Render feature plot").props("unelevated").style(
+            "height:40px; background:#fbbf24; color:#0b1220; font-weight:900; border-radius:10px;"
+        )
+
+    # ----------------------------
+    # Plot area
+    # ----------------------------
+    plot_card = ui.card().classes("w-full").style(
+        "margin-top: 12px; padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+    )
+    with plot_card:
+        status = ui.label("Select genes and click Render feature plot.").style("color:#9ca3af;")
+        plot_el = ui.plotly(go.Figure()).style("width:100%; height: 760px;")
+
+    # ----------------------------
+    # Plot builder
+    # ----------------------------
+    def build_feature_plot(df: pd.DataFrame, genes: list[str]) -> go.Figure:
+        genes = [g for g in genes if g in df.columns]
+        if not genes:
+            raise KeyError("None of the selected genes exist in the gene-expression JSON.")
+
+        # sanitize genes to numeric
+        for g in genes:
+            df[g] = pd.to_numeric(df[g], errors="coerce").fillna(0.0)
+
+        clusters = sorted(df["cluster"].unique().tolist(), key=_cluster_sort_key)
+        size = int(float(pt_size.value or 3))
+        do_log = bool(log1p_toggle.value)
+        split = bool(split_by_cluster.value)
+
+        # one "gene group" = (traces + optional colorbar trace)
+        # If split_by_cluster: traces per gene = len(clusters) + 1(colorbar)
+        # Else: traces per gene = 1 + 1(colorbar)
+        if split:
+            traces_per_gene = len(clusters) + 1
+        else:
+            traces_per_gene = 1 + 1
+
+        fig = go.Figure()
+
+        # helper to compute color array
+        def color_arr(series: pd.Series) -> np.ndarray:
+            v = series.to_numpy(dtype=float)
+            if do_log:
+                v = np.log1p(np.clip(v, 0.0, None))
+            return v
+
+        for gi, gene in enumerate(genes):
+            if split:
+                for c in clusters:
+                    sub = df[df["cluster"] == c]
+                    fig.add_trace(go.Scattergl(
+                        x=sub["UMAP1"],
+                        y=sub["UMAP2"],
+                        mode="markers",
+                        name=f"Cluster {c}",
+                        marker=dict(
+                            size=size,
+                            color=color_arr(sub[gene]),
+                            colorscale="Viridis",
+                            showscale=False,
+                        ),
+                        hovertemplate=f"cluster={c}<br>{gene}=%{{marker.color:.4f}}<extra></extra>",
+                        visible=(gi == 0),
+                    ))
+            else:
+                fig.add_trace(go.Scattergl(
+                    x=df["UMAP1"],
+                    y=df["UMAP2"],
+                    mode="markers",
+                    name=gene,
+                    marker=dict(
+                        size=size,
+                        color=color_arr(df[gene]),
+                        colorscale="Viridis",
+                        showscale=False,
+                    ),
+                    hovertemplate=f"{gene}=%{{marker.color:.4f}}<extra></extra>",
+                    showlegend=False,
+                    visible=(gi == 0),
+                ))
+
+            # add a shared colorbar for this gene via dummy trace
+            vals = color_arr(df[gene])
+            gmin = float(np.nanmin(vals)) if vals.size else 0.0
+            gmax = float(np.nanmax(vals)) if vals.size else 1.0
+            fig.add_trace(go.Scattergl(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(
+                    color=[gmin, gmax],
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(title=f"{gene} ({'log1p' if do_log else 'raw'})"),
+                ),
+                hoverinfo="skip",
+                showlegend=False,
+                visible=(gi == 0),
+            ))
+
+        # dropdown to switch gene
+        buttons = []
+        for gi, gene in enumerate(genes):
+            vis = [False] * (traces_per_gene * len(genes))
+            start = gi * traces_per_gene
+            for k in range(traces_per_gene):
+                vis[start + k] = True
+            buttons.append(dict(
+                label=gene,
+                method="update",
+                args=[
+                    {"visible": vis},
+                    {"title": f"Feature Expression: {gene} ({'split clusters' if split else 'all cells'})"},
+                ],
+            ))
+
+        fig.update_layout(
+            title=f"Feature Expression: {genes[0]} ({'split clusters' if split else 'all cells'})",
+            height=760,
+            margin=dict(l=20, r=20, t=70, b=20),
+            legend=dict(itemsizing="constant"),
+            updatemenus=[dict(
+                type="dropdown",
+                x=0.01, y=1.15,
+                xanchor="left", yanchor="top",
+                buttons=buttons,
+            )] if len(genes) > 1 else [],
+        )
+        fig.update_xaxes(title="UMAP1")
+        fig.update_yaxes(title="UMAP2")
+        return fig
+
+    # ----------------------------
+    # Render handler (slot-safe: no create_task)
+    # ----------------------------
+    async def render_feature(e=None):
+        with plot_card:
+            render_btn.disable()
+            try:
+                if not selected_genes:
+                    ui.notify("Select at least one gene.", color="negative")
+                    return
+
+                # cap genes to keep plot responsive
+                cap = int(float(max_genes.value or 25))
+                genes = selected_genes[: max(1, cap)]
+
+                status.text = "Computing gene expression + loading JSON…"
+
+                # Ensure the JSON exists/updated (your backend)
+                # This can be heavy, so run in a thread.
+                def _work():
+                    gene_expression(SELECTED_PROJECT_PATH, adata, genes)
+                    print('inside _work', SELECTED_PROJECT_PATH)
+                    return load_gene_expression_df(SELECTED_PROJECT_PATH)
+
+                df = await asyncio.to_thread(_work)
+
+                status.text = "Rendering…"
+                fig = build_feature_plot(df, genes)
+
+                plot_el.figure = fig
+                plot_el.update()
+
+                status.text = f"Rendered feature plot for {len([g for g in genes if g in df.columns])} gene(s)."
+                ui.notify("Feature plot rendered", color="positive")
+
+            except Exception as ex:
+                status.text = f"Failed: {ex}"
+                ui.notify(f"Feature plot failed: {ex}", color="negative")
+            finally:
+                render_btn.enable()
+
+    render_btn.on("click", render_feature)
+
+    ui.separator().style("opacity:0.25; margin: 14px 0;")
+    ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+
+@ui.page("/receptor_ligand")
+def receptor_ligand_page():
+    ui.dark_mode().enable()
+
+    ui.label("Receptor–Ligand").style(
+        "font-size: 32px; font-weight: 800; color: #fb7185; margin: 12px 0;"
+    )
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
+    # ----------------------------
+    # Resolve project
+    # ----------------------------
+    SELECTED_PROJECT_PATH = None
+    if SELECTED_PROJECT and isinstance(SELECTED_PROJECT, dict):
+        SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path")
+    if not SELECTED_PROJECT_PATH:
+        ui.notify("No project selected. Returning to dashboard.", color="negative")
+        ui.navigate.to("/")
+        return
+    SELECTED_PROJECT_PATH = str(SELECTED_PROJECT_PATH)
+
+    adata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_annotated.h5ad"
+    if not adata_path.exists():
+        ui.label("adata_annotated.h5ad not found. Run PA/Annotations first.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    # Load adata
+    try:
+        adata = read_adata(adata_path)
+    except Exception as e:
+        ui.notify(f"Failed to load adata: {e}", color="negative")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    # Detect cluster key
+    try:
+        cluster_series = _get_cluster_series_from_adata(adata)
+        # find the actual key name if possible
+        cluster_key = None
+        for k in ("leiden", "cluster", "clusters", "louvain"):
+            if k in adata.obs.columns:
+                cluster_key = k
+                break
+        if cluster_key is None:
+            # fallback: first matching column
+            for k in adata.obs.columns:
+                lk = k.lower()
+                if "leiden" in lk or "cluster" in lk or "louvain" in lk:
+                    cluster_key = k
+                    break
+        clusters = sorted(cluster_series.unique().tolist(), key=_cluster_sort_key)
+    except Exception as e:
+        cluster_key = None
+        clusters = []
+        ui.notify(f"Could not detect clusters: {e}", color="negative")
+
+    # ----------------------------
+    # Find LR database files (optional)
+    # ----------------------------
+    # Expected formats:
+    # - CSV/TSV with columns: ligand, receptor (case-insensitive)
+    # Put one here: <project>/cellborg-cli/lr_db.csv  (or .tsv)
+    lr_candidates = []
+    for fn in ("lr_db.csv", "lr_db.tsv", "ligand_receptor.csv", "ligand_receptor.tsv"):
+        p = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / fn
+        if p.exists():
+            lr_candidates.append(p)
+
+    # ----------------------------
+    # UI layout
+    # ----------------------------
+    with ui.row().classes("w-full").style("gap:18px; padding:12px; height: calc(100vh - 140px);"):
+        # LEFT: controls
+        with ui.column().style("width:520px; gap:12px;"):
+            ui.label("Controls").style("color:#e5e7eb; font-weight:800; font-size:18px;")
+
+            ctrl = ui.card().classes("w-full").style(
+                "padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+            )
+            with ctrl:
+                ui.label("Groups").style("color:#9ca3af; font-weight:700;")
+                if not clusters:
+                    ui.label("No clusters found in adata.obs.").style("color:#fbbf24;")
+                sender_sel = ui.select(
+                    options=clusters,
+                    value=(clusters[0] if clusters else None),
+                    label=f"Sender cluster ({cluster_key or 'missing'})",
+                ).props("outlined dense").style("width:100%;")
+
+                receiver_sel = ui.select(
+                    options=clusters,
+                    value=(clusters[1] if len(clusters) > 1 else (clusters[0] if clusters else None)),
+                    label=f"Receiver cluster ({cluster_key or 'missing'})",
+                ).props("outlined dense").style("width:100%;")
+
+                ui.separator().style("opacity:0.25; margin: 8px 0;")
+
+                ui.label("LR database").style("color:#9ca3af; font-weight:700;")
+                if lr_candidates:
+                    lr_map = {str(p): p.name for p in lr_candidates}
+                    lr_sel = ui.select(
+                        options=lr_map,
+                        value=str(lr_candidates[0]),
+                        label="Ligand–Receptor file",
+                    ).props("outlined dense").style("width:100%;")
+                else:
+                    lr_sel = None
+                    ui.label(
+                        "No LR DB file found.\nAdd one at: cellborg-cli/lr_db.csv (columns: ligand,receptor)"
+                    ).style("white-space:pre-line; color:#fbbf24; font-size:14px;")
+
+                ui.separator().style("opacity:0.25; margin: 8px 0;")
+
+                top_n = ui.number("Top N interactions", value=50, format="%.0f").props("outlined dense").style("width:100%;")
+                min_mean = ui.number("Min mean expr (ligand & receptor)", value=0.0, format="%.3f").props("outlined dense").style("width:100%;")
+                use_log1p = ui.switch("log1p transform", value=False).style("color:#e5e7eb;")
+
+                run_btn = ui.button("Compute interactions").props("unelevated").style(
+                    "width:100%; height:44px; border-radius:10px; background:#fb7185; color:#0b1220; font-weight:900;"
+                )
+
+                ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat").style("width:100%;")
+
+        # RIGHT: outputs
+        with ui.column().style("flex:1; gap:12px;"):
+            ui.label("Predicted interactions").style(
+                "font-size: 20px; font-weight: 800; color:#e5e7eb; text-align:center; margin-top:6px;"
+            )
+
+            out_card = ui.card().classes("w-full").style(
+                "flex:1; padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+            )
+            with out_card:
+                status = ui.label("Pick sender/receiver and click Compute interactions.").style("color:#9ca3af;")
+                plot_el = ui.plotly(go.Figure()).style("width:100%; height: 520px;")
+                table_el = ui.table(
+                    columns=[
+                        {"name": "rank", "label": "#", "field": "rank", "align": "left"},
+                        {"name": "ligand", "label": "Ligand", "field": "ligand"},
+                        {"name": "receptor", "label": "Receptor", "field": "receptor"},
+                        {"name": "lig_mean", "label": "Lig mean (sender)", "field": "lig_mean"},
+                        {"name": "rec_mean", "label": "Rec mean (receiver)", "field": "rec_mean"},
+                        {"name": "score", "label": "Score", "field": "score"},
+                    ],
+                    rows=[],
+                    row_key="rank",
+                ).classes("w-full").style("margin-top:10px;")
+
+    # ----------------------------
+    # Helpers
+    # ----------------------------
+    def _read_lr_db(path: Path) -> pd.DataFrame:
+        # Accept csv/tsv. Must include ligand/receptor cols.
+        if path.suffix.lower() == ".tsv":
+            df = pd.read_csv(path, sep="\t")
+        else:
+            df = pd.read_csv(path)
+
+        cols = {c.lower(): c for c in df.columns}
+        if "ligand" not in cols or "receptor" not in cols:
+            raise ValueError("LR DB must have columns named ligand and receptor (case-insensitive).")
+
+        out = df[[cols["ligand"], cols["receptor"]]].copy()
+        out.columns = ["ligand", "receptor"]
+        out["ligand"] = out["ligand"].astype(str)
+        out["receptor"] = out["receptor"].astype(str)
+        out = out.dropna().drop_duplicates()
+        return out
+
+    def _mean_expr_for_genes(adata_sub, genes: list[str]) -> dict[str, float]:
+        """
+        Return mean expression per gene for adata_sub.
+        Works with sparse/dense X.
+        """
+        genes = [g for g in genes if g in adata_sub.var_names]
+        if not genes:
+            return {}
+
+        # slice in var dimension once
+        sub = adata_sub[:, genes]
+        X = sub.X
+
+        # mean per column
+        try:
+            import scipy.sparse as sp  # type: ignore
+            if sp.issparse(X):
+                m = np.asarray(X.mean(axis=0)).ravel()
+            else:
+                m = np.asarray(X).mean(axis=0)
+        except Exception:
+            m = np.asarray(X).mean(axis=0)
+
+        if bool(use_log1p.value):
+            m = np.log1p(np.clip(m, 0.0, None))
+
+        return {g: float(v) for g, v in zip(genes, m)}
+
+    def _build_scatter(df: pd.DataFrame, title: str) -> go.Figure:
+        # Scatter: lig_mean vs rec_mean colored by score
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df["lig_mean"],
+            y=df["rec_mean"],
+            mode="markers",
+            marker=dict(
+                size=10,
+                color=df["score"],
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="Score"),
+            ),
+            text=df["ligand"] + " → " + df["receptor"],
+            hovertemplate="%{text}<br>lig=%{x:.4f}<br>rec=%{y:.4f}<br>score=%{marker.color:.4f}<extra></extra>",
+            showlegend=False,
+        ))
+        fig.update_layout(
+            title=title,
+            height=520,
+            margin=dict(l=40, r=20, t=60, b=40),
+            xaxis_title="Ligand mean (sender)",
+            yaxis_title="Receptor mean (receiver)",
+        )
+        return fig
+
+    # ----------------------------
+    # Compute handler (slot-safe)
+    # ----------------------------
+    async def run_rl(e=None):
+        with out_card:
+            run_btn.disable()
+            try:
+                if not cluster_key or not clusters:
+                    ui.notify("Clusters not available. Run Leiden/PA first.", color="negative")
+                    return
+
+                sender = str(sender_sel.value)
+                receiver = str(receiver_sel.value)
+                if not sender or not receiver:
+                    ui.notify("Select sender and receiver.", color="negative")
+                    return
+
+                if lr_sel is None:
+                    ui.notify("Add an LR DB file first (cellborg-cli/lr_db.csv).", color="negative")
+                    return
+
+                lr_path = Path(str(lr_sel.value))
+                if not lr_path.exists():
+                    ui.notify(f"LR DB not found: {lr_path}", color="negative")
+                    return
+
+                N = int(float(top_n.value or 50))
+                N = max(5, min(N, 500))
+                thr = float(min_mean.value or 0.0)
+
+                status.text = "Loading LR DB + computing means…"
+
+                def _work():
+                    lr = _read_lr_db(lr_path)
+
+                    # restrict to genes that exist in var_names
+                    ligands = sorted(set(lr["ligand"].tolist()))
+                    receptors = sorted(set(lr["receptor"].tolist()))
+
+                    # subset sender/receiver cells
+                    s_mask = (adata.obs[cluster_key].astype(str) == sender).to_numpy()
+                    r_mask = (adata.obs[cluster_key].astype(str) == receiver).to_numpy()
+
+                    if s_mask.sum() == 0 or r_mask.sum() == 0:
+                        raise ValueError("Sender or receiver cluster has 0 cells.")
+
+                    ad_s = adata[s_mask, :]
+                    ad_r = adata[r_mask, :]
+
+                    lig_means = _mean_expr_for_genes(ad_s, ligands)
+                    rec_means = _mean_expr_for_genes(ad_r, receptors)
+
+                    rows = []
+                    for _, row in lr.iterrows():
+                        lig = row["ligand"]
+                        rec = row["receptor"]
+                        lm = lig_means.get(lig)
+                        rm = rec_means.get(rec)
+                        if lm is None or rm is None:
+                            continue
+                        if lm < thr or rm < thr:
+                            continue
+                        score = lm * rm
+                        rows.append((lig, rec, lm, rm, score))
+
+                    out = pd.DataFrame(rows, columns=["ligand", "receptor", "lig_mean", "rec_mean", "score"])
+                    if out.empty:
+                        return out
+
+                    out = out.sort_values("score", ascending=False).head(N).reset_index(drop=True)
+                    out.insert(0, "rank", np.arange(1, len(out) + 1))
+                    return out
+
+                df = await asyncio.to_thread(_work)
+
+                if df is None or df.empty:
+                    status.text = "No interactions passed filters (genes missing or below threshold)."
+                    table_el.rows = []
+                    table_el.update()
+                    plot_el.figure = go.Figure()
+                    plot_el.update()
+                    ui.notify("No interactions found.", color="warning")
+                    return
+
+                # render
+                status.text = f"Top {len(df)} interactions: sender {sender} → receiver {receiver}"
+                table_el.rows = [
+                    {
+                        "rank": int(r.rank),
+                        "ligand": r.ligand,
+                        "receptor": r.receptor,
+                        "lig_mean": f"{float(r.lig_mean):.4f}",
+                        "rec_mean": f"{float(r.rec_mean):.4f}",
+                        "score": f"{float(r.score):.4f}",
+                    }
+                    for r in df.itertuples(index=False)
+                ]
+                table_el.update()
+
+                fig = _build_scatter(df, title=f"LR interactions (sender {sender} → receiver {receiver})")
+                plot_el.figure = fig
+                plot_el.update()
+
+                ui.notify("Computed receptor–ligand interactions", color="positive")
+
+            except Exception as ex:
+                status.text = f"Failed: {ex}"
+                ui.notify(f"Receptor–ligand failed: {ex}", color="negative")
+            finally:
+                run_btn.enable()
+
+    run_btn.on("click", run_rl)
 
 
 # -----------------------------
