@@ -1,25 +1,58 @@
+
 # Cellborg CLI — Simple project dashboard for biologists
 
 This tool provides a small, easy-to-use dashboard for managing single-cell
-projects on your computer. It is designed for researchers who want a simple
+projects on your computer. It is intended for researchers who want a simple
 way to organize data folders and run basic QC steps without writing code.
 
 If this tool helps your work, please star the repository — it really helps!
 
-If you find this useful, please star the repo — it helps the project grow.
-
-## What it does (in plain words)
+## What it does (plain words)
 
 - Shows a list of projects found in the `projects/` folder.
 - Lets you import (copy) a project folder from your computer using a Finder
   / file-picker dialog. The folder will be copied into `./projects/` so the app
   can keep a local copy.
-- Provides helpers for running QC and generating plots (advanced features).
+- Provides optional helpers for running QC and generating plots (advanced
+  features for users who have the scientific Python packages installed).
 
-## Easy setup (3 steps)
+## Get the code from GitHub — step-by-step (for non-technical users)
 
-1. Install Python 3.10 or newer. On macOS you can use the official installer
-   from python.org or Homebrew.
+If you are starting on GitHub and want to get a copy of this project to your
+computer, follow these steps.
+
+1. Open a web browser and go to the project page:
+
+   https://github.com/NishantN2005/cellborg-cli
+
+2. Click the green "Code" button and copy the HTTPS URL (it looks like
+   `https://github.com/NishantN2005/cellborg-cli.git`).
+
+   [Screenshot placeholder: GitHub Code button]
+
+3. Open the Terminal application on your computer and run these commands:
+
+```bash
+git clone https://github.com/NishantN2005/cellborg-cli.git
+cd cellborg-cli
+```
+
+If you prefer a graphical option, you can select "Open with GitHub Desktop"
+from the same menu and follow the prompts in GitHub Desktop.
+
+   [Screenshot placeholder: Terminal showing git clone]
+
+## Easy setup (three steps)
+
+Follow these three steps to prepare and run the dashboard locally. After each
+subsection in Step 3 there is a placeholder where you can add a screenshot.
+
+Step 1 — Prepare Python
+
+1. Install Python 3.10 or newer if you do not already have it. On macOS you
+   can download the installer from python.org or use Homebrew.
+
+   [Screenshot placeholder: Python download page]
 
 2. Create and activate a Python virtual environment, then install packages:
 
@@ -29,38 +62,63 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Start the dashboard and open it in your web browser:
+   [Screenshot placeholder: Terminal showing virtualenv commands]
+
+Step 2 — (Optional) macOS system package
+
+On macOS, the folder-picker dialog uses Tcl/Tk (tkinter). If the Add Project
+dialog does not open, you may need to install Tcl/Tk via Homebrew:
+
+```bash
+brew install tcl-tk
+```
+
+   [Screenshot placeholder: Homebrew install output]
+
+Step 3 — Start and use the dashboard (user steps)
+
+3a. Start the dashboard server
 
 ```bash
 python main.py
 ```
 
-The dashboard will pop-up with the projects list and right side of the screen being empty.
+The app runs a small local web server. Open your browser to
+`http://localhost:8080` to see the dashboard.
 
-Click add projects to copy over the desired folder, once you do this enter a title and description. The project should now be visible in the list.
+   [Screenshot placeholder: Browser open to localhost:8080]
 
+3b. Add a project (Import)
 
-When you click the project options should appear on the right to do QC.
+- Click the "Add New Project" button in the dashboard.
+- A folder picker will appear — choose the folder on your computer that holds
+  the project (for example, your 10x output folder). The tool will copy that
+  folder into `./projects/` so the dashboard can manage it.
 
-When you click 'Run QC' the page will stay still for a little, this is the processing happening in the background (I haven't implemented loaders yet). You will know it is finished if you get directed to the next page, else you will see an error log in the console.
+   [Screenshot placeholder: Add New Project dialog]
 
+3c. View and manage
 
-Once you finish QC, you will return to the dashboard and the QC button will change into 'Run PA'. PA stands for 'Processing & Annotations'. 
+- After the copy completes, the project appears in the project list. Click it
+  to view metadata and use the QC helpers.
 
-Click PA
-
-
-Once PA is done, you will return to the dashboard. Click 'Run Analysis'.
+   [Screenshot placeholder: Project selected in dashboard]
 
 ## Notes & troubleshooting (non-technical)
+
 - The app copies your selected folder — it does not delete your original data.
   If a folder with the same name already exists in `projects/`, a number will
   be added (for example `myproj-1`).
-- The QC/plot features use scientific Python packages (Scanpy, AnnData). These
-  are included in `requirements.txt` but may need extra system libraries. You
-  can still use the dashboard to manage and view projects without running QC.
+- The QC and plotting features use scientific Python packages (Scanpy, AnnData
+  and their dependencies). These are listed in `requirements.txt` but may need
+  extra system libraries. You can still use the dashboard to manage and view
+  projects without running the full QC.
 
 ## Want help or improvements?
 
-- If something doesn't work, tell me which step failed (which command and the error message) and I can help troubleshoot by clicking 'Issues' at the top of the github repo and creating a new issue.
+- If something doesn't work, tell me which step failed (which command and any
+  error message) and I can help troubleshoot. The GitHub repository's
+  "Issues" tab is a good place to report problems.
+
+If you find this useful, please star the repo — it helps the project grow.
 
