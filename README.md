@@ -1,4 +1,3 @@
-<img width="1728" height="1117" alt="Screenshot 2026-02-17 at 7 00 06 PM" src="https://github.com/user-attachments/assets/e2b0e85c-c61a-444f-b654-37d527486b54" />
 # Cellborg CLI
 
 This tool provides a small, easy-to-use dashboard for managing single-cell
