@@ -1,5 +1,5 @@
 
-# Cellborg CLI — Simple project dashboard for biologists
+# Cellborg CLI
 
 This tool provides a small, easy-to-use dashboard for managing single-cell
 projects on your computer. It is intended for researchers who want a simple
@@ -7,30 +7,14 @@ way to organize data folders and run basic QC steps without writing code.
 
 If this tool helps your work, please star the repository — it really helps!
 
-## What it does (plain words)
 
-- Shows a list of projects found in the `projects/` folder.
-- Lets you import (copy) a project folder from your computer using a Finder
-  / file-picker dialog. The folder will be copied into `./projects/` so the app
-  can keep a local copy.
-- Provides optional helpers for running QC and generating plots (advanced
-  features for users who have the scientific Python packages installed).
-
-## Get the code from GitHub — step-by-step (for non-technical users)
-
-If you are starting on GitHub and want to get a copy of this project to your
-computer, follow these steps.
-
-1. Open a web browser and go to the project page:
-
-   https://github.com/NishantN2005/cellborg-cli
-
-2. Click the green "Code" button and copy the HTTPS URL (it looks like
+## Get the code — step-by-step
+1. Click the green "Code" button and copy the HTTPS URL (it looks like
    `https://github.com/NishantN2005/cellborg-cli.git`).
 
    [Screenshot placeholder: GitHub Code button]
 
-3. Open the Terminal application on your computer and run these commands:
+2. Open the Terminal application on your computer and run these commands:
 
 ```bash
 git clone https://github.com/NishantN2005/cellborg-cli.git
