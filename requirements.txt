@@ -1,0 +1,5 @@
+nicegui>=1.0
+plotly>=5.0
+scanpy>=1.9
+anndata>=0.8
+pandas>=1.4
