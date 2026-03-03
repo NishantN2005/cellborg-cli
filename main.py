@@ -274,7 +274,7 @@ def load_umap_dict(project_path: str | Path, resolution: float) -> dict:
     return json.loads(umap_path.read_text(encoding="utf-8"))
 
 
-def umap_scatter_figure_from_dict(umap_dict: dict, title="UMAP (Leiden clusters)"):
+def umap_scatter_figure_from_dict(umap_dict: dict, title="UMAP (Leiden clusters)", annotations: dict | None = None):
     """
     umap_dict format:
     {
@@ -282,6 +282,8 @@ def umap_scatter_figure_from_dict(umap_dict: dict, title="UMAP (Leiden clusters)
         ...
     }
     One trace per cluster => Plotly assigns different colors automatically.
+    
+    annotations: optional dict mapping cluster IDs to cell type names
     """
     df = pd.DataFrame.from_dict(umap_dict, orient="index")
 
@@ -293,6 +295,14 @@ def umap_scatter_figure_from_dict(umap_dict: dict, title="UMAP (Leiden clusters)
 
     clusters = sorted(df["cluster"].unique(), key=_cluster_sort_key)
 
+    # Build cluster display names from annotations
+    cluster_display_names = {}
+    for c in clusters:
+        if annotations and str(c) in annotations and annotations[str(c)]:
+            cluster_display_names[c] = f"{c}: {annotations[str(c)]}"
+        else:
+            cluster_display_names[c] = c
+
     fig = go.Figure()
     for c in clusters:
         sub = df[df["cluster"] == c]
@@ -301,7 +311,7 @@ def umap_scatter_figure_from_dict(umap_dict: dict, title="UMAP (Leiden clusters)
                 x=sub["UMAP1"],
                 y=sub["UMAP2"],
                 mode="markers",
-                name=f"Cluster {c}",
+                name=cluster_display_names[c],
                 marker=dict(size=3),
                 hoverinfo="skip",
             )
@@ -783,7 +793,12 @@ def pca_page():
             await asyncio.to_thread(do_clustering, adata, res)
 
             umap_dict = load_umap_dict(SELECTED_PROJECT_PATH, res)
-            fig = umap_scatter_figure_from_dict(umap_dict, title=f"UMAP (Leiden res={res:.2f})")
+            # Load annotations for display
+            try:
+                annotations = _load_existing_annotations(SELECTED_PROJECT_PATH)
+            except Exception:
+                annotations = None
+            fig = umap_scatter_figure_from_dict(umap_dict, title=f"UMAP (Leiden res={res:.2f})", annotations=annotations)
 
             umap_plot.figure = fig
             umap_plot.update()
@@ -1079,7 +1094,12 @@ def annotation_page():
 
                         plot_status.text = f"Loading cluster UMAP (res={res:.2f})…"
                         umap_dict = load_umap_dict(SELECTED_PROJECT_PATH, res)
-                        fig = umap_scatter_figure_from_dict(umap_dict, title=f"UMAP (Leiden res={res:.2f})")
+                        # Load annotations for display
+                        try:
+                            annotations = _load_existing_annotations(SELECTED_PROJECT_PATH)
+                        except Exception:
+                            annotations = None
+                        fig = umap_scatter_figure_from_dict(umap_dict, title=f"UMAP (Leiden res={res:.2f})", annotations=annotations)
 
                         plot_el.figure = fig
                         plot_el.update()
@@ -1626,13 +1646,25 @@ def heatmap_page():
                     ui.notify("None of the selected genes exist in adata.var_names.", color="negative")
                     return
 
+                # Load cluster annotations and map cluster IDs to names
+                cluster_labels = mat.index.tolist()
+                try:
+                    existing_ann = _load_existing_annotations(SELECTED_PROJECT_PATH)
+                    # Map cluster ID -> annotation (or keep ID if no annotation)
+                    cluster_labels = [
+                        f"{cid}: {existing_ann.get(str(cid), '')}" if existing_ann.get(str(cid)) else cid
+                        for cid in cluster_labels
+                    ]
+                except Exception:
+                    pass  # If annotation loading fails, use raw cluster IDs
+
                 # Plotly heatmap
                 fig = go.Figure()
                 fig.add_trace(
                     go.Heatmap(
                         z=mat.to_numpy(dtype=float),
                         x=mat.columns.tolist(),
-                        y=mat.index.tolist(),
+                        y=cluster_labels,
                         hovertemplate="Cluster=%{y}<br>Gene=%{x}<br>Value=%{z:.4f}<extra></extra>",
                         colorbar=dict(title=("Z" if scale == "zscore" else metric)),
                     )
@@ -1815,13 +1847,24 @@ def pseudotime_page():
             df["color"] = adata.obs[cluster_key].astype(str).values
             # one trace per cluster for categorical colors
             clusters = sorted(df["color"].unique().tolist(), key=_cluster_sort_key)
+            
+            # Load cluster annotations for display names
+            try:
+                existing_ann = _load_existing_annotations(SELECTED_PROJECT_PATH)
+                cluster_display_names = {
+                    cid: f"{cid}: {existing_ann.get(str(cid), '')}" if existing_ann.get(str(cid)) else cid
+                    for cid in clusters
+                }
+            except Exception:
+                cluster_display_names = {cid: cid for cid in clusters}
+            
             fig = go.Figure()
             for c in clusters:
                 sub = df[df["color"] == c]
                 fig.add_trace(go.Scattergl(
                     x=sub["UMAP1"], y=sub["UMAP2"],
                     mode="markers",
-                    name=f"{cluster_key} {c}",
+                    name=cluster_display_names.get(c, c),
                     marker=dict(size=3),
                     hoverinfo="skip",
                 ))
@@ -2119,6 +2162,17 @@ def feature_expression_page():
             df[g] = pd.to_numeric(df[g], errors="coerce").fillna(0.0)
 
         clusters = sorted(df["cluster"].unique().tolist(), key=_cluster_sort_key)
+        
+        # Load cluster annotations for display names
+        try:
+            existing_ann = _load_existing_annotations(SELECTED_PROJECT_PATH)
+            cluster_display_names = {
+                cid: f"{cid}: {existing_ann.get(str(cid), '')}" if existing_ann.get(str(cid)) else cid
+                for cid in clusters
+            }
+        except Exception:
+            cluster_display_names = {cid: cid for cid in clusters}
+        
         size = int(float(pt_size.value or 3))
         do_log = bool(log1p_toggle.value)
         split = bool(split_by_cluster.value)
@@ -2148,7 +2202,7 @@ def feature_expression_page():
                         x=sub["UMAP1"],
                         y=sub["UMAP2"],
                         mode="markers",
-                        name=f"Cluster {c}",
+                        name=cluster_display_names.get(c, c),
                         marker=dict(
                             size=size,
                             color=color_arr(sub[gene]),
