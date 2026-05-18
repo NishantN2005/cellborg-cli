@@ -28,6 +28,7 @@ from pa_functions import (
     do_clustering,
     gene_expression,
     annotations,
+    run_differential_expression,
 )
 
 from heatmap_functions import compute_cluster_gene_heatmap, prepare_heatmap_matrix
@@ -1423,6 +1424,14 @@ def analysis_page():
                 on_click=lambda: ui.navigate.to("/receptor_ligand"),
             )
 
+            analysis_tile(
+                "Differential Expression",
+                "Marker genes per cluster via Wilcoxon or t-test.",
+                "bar_chart",
+                "#a78bfa",
+                on_click=lambda: ui.navigate.to("/de"),
+            )
+
 @ui.page("/heatmap")
 def heatmap_page():
     ui.dark_mode().enable()
@@ -2324,6 +2333,196 @@ def feature_expression_page():
 
     ui.separator().style("opacity:0.25; margin: 14px 0;")
     ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+
+@ui.page("/de")
+def de_page():
+    ui.dark_mode().enable()
+
+    ui.label("Differential Expression").style(
+        "font-size: 32px; font-weight: 800; color: #a78bfa; margin: 12px 0;"
+    )
+    ui.separator().style("opacity:0.25; margin: 12px 0;")
+
+    SELECTED_PROJECT_PATH = SELECTED_PROJECT.get("project_path") if SELECTED_PROJECT else None
+    if not SELECTED_PROJECT_PATH:
+        ui.label("No project selected. Go back and select one.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    adata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_annotated.h5ad"
+    if not adata_path.exists():
+        adata_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "adata_clustered.h5ad"
+    if not adata_path.exists():
+        ui.label("Clustered dataset not found. Run PA/Annotations first.").style("color:#fbbf24;")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    try:
+        adata = read_adata(adata_path)
+    except Exception as e:
+        ui.notify(f"Failed to load adata: {e}", color="negative")
+        ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat")
+        return
+
+    # Mutable dict — mutated in-place so closures always see the latest data
+    de_results: dict = {}
+    de_json_path = Path(SELECTED_PROJECT_PATH) / "cellborg-cli" / "de_results.json"
+    if de_json_path.exists():
+        try:
+            de_results.update(json.loads(de_json_path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    with ui.row().classes("w-full").style("gap:18px; padding:12px; height: calc(100vh - 140px);"):
+        # LEFT: controls
+        with ui.column().style("width:520px; gap:12px;"):
+            ui.label("Controls").style("color:#e5e7eb; font-weight:800; font-size:18px;")
+
+            ctrl = ui.card().classes("w-full").style(
+                "padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+            )
+            with ctrl:
+                method_sel = ui.select(
+                    options={"wilcoxon": "Wilcoxon rank-sum", "t-test": "t-test"},
+                    value="wilcoxon",
+                    label="Test method",
+                ).props("outlined dense").style("width:100%;")
+
+                n_genes_in = ui.number("Top N genes per cluster", value=25, format="%.0f").props("outlined dense").style("width:100%;")
+
+                run_btn = ui.button("Run DE").props("unelevated").style(
+                    "width:100%; height:44px; border-radius:10px; background:#a78bfa; color:#0b1220; font-weight:900; margin-top:8px;"
+                )
+
+                ui.button("Back to Analysis", on_click=lambda: ui.navigate.to("/analysis")).props("flat").style("width:100%;")
+
+        # RIGHT: results
+        with ui.column().style("flex:1; gap:12px;"):
+            ui.label("Marker genes per cluster").style(
+                "font-size: 20px; font-weight: 800; color:#e5e7eb; text-align:center; margin-top:6px;"
+            )
+
+            out_card = ui.card().classes("w-full").style(
+                "flex:1; padding:12px; border:1px solid #374151; border-radius:10px; background:#0b1220;"
+            )
+            with out_card:
+                init_msg = "Previous results loaded — click Run DE to recompute." if de_results else "Click Run DE to compute marker genes."
+                status = ui.label(init_msg).style("color:#9ca3af;")
+
+                controls_row = ui.row().classes("w-full items-center").style("gap:12px; margin-bottom:10px;")
+                plot_el = ui.plotly(go.Figure()).style("width:100%; height: 440px;")
+
+                table_el = ui.table(
+                    columns=[
+                        {"name": "rank", "label": "#", "field": "rank", "align": "left", "sortable": True},
+                        {"name": "gene", "label": "Gene", "field": "gene", "sortable": True},
+                        {"name": "score", "label": "Score", "field": "score", "sortable": True},
+                        {"name": "logfc", "label": "Log2FC", "field": "logfc", "sortable": True},
+                        {"name": "pval_adj", "label": "Adj. p-val", "field": "pval_adj", "sortable": True},
+                    ],
+                    rows=[],
+                    row_key="rank",
+                ).classes("w-full").style("margin-top:10px;")
+
+                export_btn = ui.button("Export CSV").props("flat").style("margin-top:8px; color:#a78bfa;")
+
+    def _build_bar_chart(cluster: str) -> go.Figure:
+        rows = de_results.get(cluster, [])
+        if not rows:
+            return go.Figure()
+        genes = [r["gene"] for r in rows]
+        scores = [r["score"] for r in rows]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=scores[::-1],
+            y=genes[::-1],
+            orientation="h",
+            marker=dict(color="#a78bfa"),
+        ))
+        fig.update_layout(
+            title=f"Top marker genes — Cluster {cluster}",
+            height=440,
+            margin=dict(l=10, r=20, t=50, b=20),
+            xaxis_title="Score",
+        )
+        return fig
+
+    def _update_table(cluster: str):
+        rows = de_results.get(cluster, [])
+        table_el.rows = [
+            {
+                "rank": i + 1,
+                "gene": r["gene"],
+                "score": f"{r['score']:.4f}",
+                "logfc": f"{r['logfc']:.4f}",
+                "pval_adj": f"{r['pval_adj']:.2e}",
+            }
+            for i, r in enumerate(rows)
+        ]
+        table_el.update()
+
+    def _render_for_cluster(cluster: str):
+        plot_el.figure = _build_bar_chart(cluster)
+        plot_el.update()
+        _update_table(cluster)
+
+    def _setup_results_ui():
+        clusters = sorted(de_results.keys(), key=_cluster_sort_key)
+        if not clusters:
+            return
+
+        controls_row.clear()
+        with controls_row:
+            cluster_sel = ui.select(
+                options=clusters,
+                value=clusters[0],
+                label="View cluster",
+            ).props("outlined dense").style("min-width:200px;")
+            cluster_sel.on("change", lambda e: _render_for_cluster(str(cluster_sel.value)))
+
+        _render_for_cluster(clusters[0])
+
+    if de_results:
+        _setup_results_ui()
+
+    def _export_csv():
+        if not de_results:
+            ui.notify("Run DE first.", color="negative")
+            return
+        rows = []
+        for cluster, genes in de_results.items():
+            for r in genes:
+                rows.append({"cluster": cluster, **r})
+        csv_bytes = pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+        ui.download(csv_bytes, filename="de_results.csv")
+
+    export_btn.on("click", lambda e: _export_csv())
+
+    async def _run_de():
+        run_btn.disable()
+        status.text = "Running DE analysis…"
+        try:
+            method = str(method_sel.value)
+            n = max(5, min(int(float(n_genes_in.value or 25)), 200))
+
+            def _work():
+                return run_differential_expression(adata, SELECTED_PROJECT_PATH, method=method, n_genes=n)
+
+            new_results = await asyncio.to_thread(_work)
+            de_results.clear()
+            de_results.update(new_results)
+
+            _setup_results_ui()
+            status.text = f"Done. {len(de_results)} clusters, top {n} genes each."
+            ui.notify("Differential expression complete", color="positive")
+        except Exception as e:
+            status.text = f"Failed: {e}"
+            ui.notify(f"DE failed: {e}", color="negative")
+        finally:
+            run_btn.enable()
+
+    run_btn.on("click", lambda e: asyncio.create_task(_run_de()))
+
 
 @ui.page("/receptor_ligand")
 def receptor_ligand_page():

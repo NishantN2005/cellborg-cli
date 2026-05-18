@@ -191,6 +191,38 @@ def gene_expression(project_path, adata, gene_list):
     except Exception as err:
         print('ERROR: ',str(err))
 
+def run_differential_expression(adata, project_path, method='wilcoxon', n_genes=25):
+    print(f"------ run_differential_expression begins (method={method}, n_genes={n_genes}) -------")
+    sc.tl.rank_genes_groups(adata, 'leiden', method=method, n_genes=n_genes)
+
+    result = adata.uns['rank_genes_groups']
+    cluster_names = list(result['names'].dtype.names)
+
+    de_data = {}
+    for cluster in cluster_names:
+        rows = []
+        n = len(result['names'][cluster])
+        for i in range(min(n_genes, n)):
+            try:
+                rows.append({
+                    "gene": str(result['names'][cluster][i]),
+                    "score": float(result['scores'][cluster][i]),
+                    "logfc": float(result['logfoldchanges'][cluster][i]),
+                    "pval": float(result['pvals'][cluster][i]),
+                    "pval_adj": float(result['pvals_adj'][cluster][i]),
+                })
+            except Exception:
+                break
+        de_data[cluster] = rows
+
+    out_path = Path(project_path) / "cellborg-cli" / "de_results.json"
+    with open(out_path, "w") as f:
+        json.dump(de_data, f)
+
+    print(f"Saved DE results to {out_path}")
+    return de_data
+
+
 def annotations(adata, annotations_dict):
     global project_path
     try:
